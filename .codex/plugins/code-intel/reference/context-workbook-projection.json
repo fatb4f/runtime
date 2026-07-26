@@ -1,0 +1,14 @@
+{
+  "authority": false,
+  "browserlessAdapter": ".codex/context-workbook/workbook_cli.py",
+  "configDigest": "sha256:a4226ed5c5fa18346cadcb222438073776c8e87769ff0398cdf0b5b2b21e1ff4",
+  "generated": true,
+  "modelSchema": "dotfiles.context-model.v0",
+  "modelScope": "dotfiles_codex_plugins",
+  "modelStatus": "provisional",
+  "outputSchema": "dotfiles.code-intel-context.v0",
+  "plugin": "code-intel",
+  "role": "evidence-adapter",
+  "schema": "dotfiles.context-workbook-plugin-projection.v0",
+  "workbook": ".codex/context-workbook/context-workbook.py"
+}

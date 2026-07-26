@@ -1,0 +1,68 @@
+{
+  "schema": "factory.plugin-bundle.code-intel.mcp.tool-registry.v1",
+  "reference": true,
+  "authority": false,
+  "defaultReadOnly": true,
+  "tools": [
+    {
+      "id": "cue.vet",
+      "server": "factory-cue",
+      "inputs": {
+        "root": "relative path",
+        "package": "optional package selector"
+      },
+      "outputs": {
+        "result": "pass/fail diagnostics"
+      },
+      "authority": false
+    },
+    {
+      "id": "cue.export",
+      "server": "factory-cue",
+      "inputs": {
+        "root": "relative path",
+        "expression": "CUE expression name"
+      },
+      "outputs": {
+        "json": "exported value"
+      },
+      "authority": false
+    },
+    {
+      "id": "cue.eval",
+      "server": "factory-cue",
+      "inputs": {
+        "root": "relative path",
+        "expression": "CUE expression name"
+      },
+      "outputs": {
+        "value": "evaluated CUE value"
+      },
+      "authority": false
+    },
+    {
+      "id": "rg.search",
+      "server": "factory-ripgrep",
+      "inputs": {
+        "pattern": "regex",
+        "path": "relative path"
+      },
+      "outputs": {
+        "matches": "bounded search results"
+      },
+      "authority": false
+    },
+    {
+      "id": "rg.files",
+      "server": "factory-ripgrep",
+      "inputs": {
+        "glob": "file glob",
+        "path": "relative path"
+      },
+      "outputs": {
+        "files": "matching paths"
+      },
+      "authority": false
+    }
+  ]
+}

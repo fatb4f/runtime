@@ -1,0 +1,30 @@
+{
+  "properties": [
+    {
+      "propertyID": "allowed-path-boundary-is-fail-closed",
+      "cases": [
+        "inside-boundary",
+        "outside-member",
+        "outside-file",
+        "repository-root-boundary"
+      ]
+    },
+    {
+      "propertyID": "proposal-and-proof-order-is-canonical",
+      "cases": [
+        "canonical-order",
+        "unsorted-proposal",
+        "duplicate-evidence",
+        "empty-canonical-lists"
+      ]
+    },
+    {
+      "propertyID": "committed-selection-evaluates-end-to-end",
+      "cases": [
+        "committed-success",
+        "committed-outside-boundary",
+        "committed-single-file"
+      ]
+    }
+  ]
+}

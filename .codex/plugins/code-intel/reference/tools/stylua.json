@@ -1,0 +1,10 @@
+{
+  "schema": "factory.plugin-bundle.code-intel.tool.stylua.v1",
+  "id": "stylua",
+  "authority": false,
+  "evidenceOnly": true,
+  "tool": "stylua",
+  "configGlobs": [
+    "chezmoi/private_dot_config/**/dot_stylua.toml"
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "schema": "factory.plugin-bundle.code-intel.lsp.provider-routing.v1",
+  "reference": true,
+  "authority": false,
+  "routes": [
+    {
+      "id": "nvim-lua",
+      "language": "lua",
+      "globs": [
+        "chezmoi/private_dot_config/nvim/**/*.lua",
+        "chezmoi/private_dot_config/nvim/init.lua"
+      ],
+      "provider": "lua-language-server",
+      "typeOverlays": [
+        "nvim-vim-types"
+      ]
+    },
+    {
+      "id": "wezterm-lua",
+      "language": "lua",
+      "globs": [
+        "chezmoi/private_dot_config/wezterm/**/*.lua",
+        "chezmoi/private_dot_config/wezterm/wezterm.lua"
+      ],
+      "provider": "lua-language-server",
+      "typeOverlays": [
+        "wezterm-types"
+      ]
+    },
+    {
+      "id": "cue-contracts",
+      "language": "cue",
+      "globs": [
+        "**/*.cue"
+      ],
+      "provider": "cue-lsp",
+      "typeOverlays": []
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "schema": "kernel.context-selection-property-cases.v0",
+  "properties": [
+    {
+      "propertyID": "relationship-predecessor-binds-edge",
+      "cases": [
+        "outgoing-proof",
+        "entity-id-predecessor",
+        "lowest-incoming-proof",
+        "relationship-order-perturbation"
+      ]
+    },
+    {
+      "propertyID": "contains-ancestry-is-bidirectional",
+      "cases": [
+        "parent-to-child",
+        "non-contains-edge",
+        "child-to-parent",
+        "root-endpoint-reversal"
+      ]
+    },
+    {
+      "propertyID": "depth-eight-is-terminal",
+      "cases": [
+        "depth-eight-terminal",
+        "reachable-ninth-entity",
+        "depth-eight-back-edge",
+        "visited-cycle-insertion"
+      ]
+    },
+    {
+      "propertyID": "submitted-root-specifications-are-bounded",
+      "cases": [
+        "sixty-four-submissions",
+        "sixty-five-submissions",
+        "one-prefix-sixty-five-seeds",
+        "cross-source-duplicate"
+      ]
+    },
+    {
+      "propertyID": "forensic-roots-preserve-layer-occurrences",
+      "cases": [
+        "superseded-exact-root",
+        "tombstone-prefix-expansion",
+        "tombstone-exact-root",
+        "effective-winner-substitution"
+      ]
+    },
+    {
+      "propertyID": "context-digest-binds-canonical-envelope",
+      "cases": [
+        "identical-input",
+        "unbound-component",
+        "empty-projection-lists",
+        "each-envelope-component"
+      ]
+    }
+  ]
+}

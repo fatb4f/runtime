@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "cue_lsp": {
+      "type": "stdio",
+      "command": "sh",
+      "args": [
+        "-c",
+        "d=$PWD; while :; do p=$d/.codex/plugins/code-intel/scripts/lsp-mcp-server; [ -x \"$p\" ] && exec \"$p\" \"$@\"; [ \"$d\" = / ] && break; d=${d%/*}; [ -n \"$d\" ] || d=/; done; echo \"code-intel launcher not found from $PWD\" >&2; exit 127",
+        "code-intel-lsp-mcp-server",
+        "cue-lsp"
+      ]
+    },
+    "gopls": {
+      "type": "stdio",
+      "command": "sh",
+      "args": [
+        "-c",
+        "d=$PWD; while :; do p=$d/.codex/plugins/code-intel/scripts/lsp-mcp-server; [ -x \"$p\" ] && exec \"$p\" \"$@\"; [ \"$d\" = / ] && break; d=${d%/*}; [ -n \"$d\" ] || d=/; done; echo \"code-intel launcher not found from $PWD\" >&2; exit 127",
+        "code-intel-lsp-mcp-server",
+        "gopls"
+      ]
+    }
+  }
+}

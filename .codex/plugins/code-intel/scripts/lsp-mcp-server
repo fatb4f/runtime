@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""Temporary repository-bounded MCP facade for CUE LSP and gopls."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any, Mapping
+
+MCP_SERVER_VERSION = "0.1.0-compat"
+
+
+class AdapterError(RuntimeError):
+    """A bounded adapter or protocol failure."""
+
+
+class LspSession:
+    """Own one persistent language-server process for one MCP process."""
+
+    def __init__(self, server: str, root: Path) -> None:
+        self.server = server
+        self.root = root.resolve(strict=True)
+        self.argv = ("cue", "lsp") if server == "cue-lsp" else ("gopls", "serve")
+        executable = shutil.which(self.argv[0])
+        if executable is None:
+            raise AdapterError(f"required executable unavailable: {self.argv[0]}")
+        self.process = subprocess.Popen(
+            [executable, *self.argv[1:]],
+            cwd=self.root,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self._write_lock = threading.Lock()
+        self._pending: dict[int, queue.Queue[dict[str, Any]]] = {}
+        self._pending_lock = threading.Lock()
+        self._next_id = 1
+        self._versions: dict[str, int] = {}
+        self._diagnostics: dict[str, list[dict[str, Any]]] = {}
+        self._diagnostic_generations: dict[str, int] = {}
+        self._diagnostic_versions: dict[str, int] = {}
+        self._stderr = bytearray()
+        threading.Thread(target=self._read_loop, daemon=True).start()
+        threading.Thread(target=self._stderr_loop, daemon=True).start()
+        initialized = self.request(
+            "initialize",
+            {
+                "processId": os.getpid(),
+                "rootUri": self.root.as_uri(),
+                "workspaceFolders": [{"uri": self.root.as_uri(), "name": self.root.name}],
+                "capabilities": {
+                    "workspace": {"configuration": True, "workspaceFolders": True},
+                    "textDocument": {
+                        "publishDiagnostics": {"relatedInformation": True},
+                        "documentSymbol": {},
+                        "definition": {},
+                        "references": {},
+                        "hover": {},
+                    },
+                },
+            },
+            timeout=20,
+        )
+        if "error" in initialized:
+            raise AdapterError(f"LSP initialize failed: {initialized['error']}")
+        self.notify("initialized", {})
+
+    def _stderr_loop(self) -> None:
+        assert self.process.stderr is not None
+        while chunk := self.process.stderr.read(4096):
+            self._stderr.extend(chunk)
+            if len(self._stderr) > 20_000:
+                del self._stderr[:-20_000]
+
+    def _read_loop(self) -> None:
+        assert self.process.stdout is not None
+        stream = self.process.stdout
+        while True:
+            headers: dict[str, str] = {}
+            while True:
+                line = stream.readline()
+                if not line:
+                    return
+                if line in {b"\r\n", b"\n"}:
+                    break
+                name, _, value = line.decode("ascii", "replace").partition(":")
+                headers[name.lower().strip()] = value.strip()
+            try:
+                length = int(headers.get("content-length", "0"))
+            except ValueError:
+                continue
+            if length <= 0:
+                continue
+            body = stream.read(length)
+            if len(body) != length:
+                return
+            try:
+                message = json.loads(body)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(message, dict):
+                continue
+            if "id" in message and "method" in message:
+                self._respond_to_server_request(message)
+            elif "id" in message and ("result" in message or "error" in message):
+                with self._pending_lock:
+                    pending = self._pending.get(int(message["id"]))
+                if pending is not None:
+                    pending.put(message)
+            elif message.get("method") == "textDocument/publishDiagnostics":
+                params = message.get("params", {})
+                uri = params.get("uri")
+                diagnostics = params.get("diagnostics")
+                if isinstance(uri, str) and isinstance(diagnostics, list):
+                    self._diagnostics[uri] = diagnostics
+                    self._diagnostic_generations[uri] = self._diagnostic_generations.get(uri, 0) + 1
+                    version = params.get("version")
+                    if isinstance(version, int):
+                        self._diagnostic_versions[uri] = version
+                    else:
+                        self._diagnostic_versions.pop(uri, None)
+
+    def _respond_to_server_request(self, message: Mapping[str, Any]) -> None:
+        request_id = message["id"]
+        method = message.get("method")
+        params = message.get("params")
+        if method == "workspace/configuration":
+            items = params.get("items", []) if isinstance(params, dict) else []
+            result: object = [None for _ in items]
+        elif method == "workspace/workspaceFolders":
+            result = [{"uri": self.root.as_uri(), "name": self.root.name}]
+        elif method in {
+            "client/registerCapability",
+            "client/unregisterCapability",
+            "window/workDoneProgress/create",
+        }:
+            result = None
+        else:
+            self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32601, "message": f"unsupported client method: {method}"},
+                }
+            )
+            return
+        self._send({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+    def _send(self, message: Mapping[str, Any]) -> None:
+        if self.process.poll() is not None:
+            raise AdapterError(f"LSP exited: {self.stderr}")
+        body = json.dumps(message, sort_keys=True, separators=(",", ":")).encode()
+        frame = f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+        assert self.process.stdin is not None
+        with self._write_lock:
+            self.process.stdin.write(frame)
+            self.process.stdin.flush()
+
+    def request(self, method: str, params: object, *, timeout: float = 10) -> dict[str, Any]:
+        request_id = self._next_id
+        self._next_id += 1
+        pending: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+        with self._pending_lock:
+            self._pending[request_id] = pending
+        self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        try:
+            return pending.get(timeout=timeout)
+        except queue.Empty as error:
+            raise AdapterError(f"LSP request timed out: {method}") from error
+        finally:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+
+    def notify(self, method: str, params: object) -> None:
+        self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    @property
+    def stderr(self) -> str:
+        return bytes(self._stderr).decode("utf-8", "replace")
+
+    def open_document(self, path: Path) -> str:
+        uri = path.as_uri()
+        version = self._versions.get(uri, 0) + 1
+        self._versions[uri] = version
+        language = "cue" if path.suffix == ".cue" else "go"
+        text = path.read_text(encoding="utf-8")
+        if version == 1:
+            self.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": uri, "languageId": language, "version": version, "text": text}},
+            )
+        else:
+            self.notify(
+                "textDocument/didChange",
+                {
+                    "textDocument": {"uri": uri, "version": version},
+                    "contentChanges": [{"text": text}],
+                },
+            )
+        return uri
+
+    def diagnostics(self, path: Path) -> dict[str, Any]:
+        uri = path.as_uri()
+        generation = self._diagnostic_generations.get(uri, 0)
+        uri = self.open_document(path)
+        document_version = self._versions[uri]
+        deadline = time.monotonic() + 3
+        fresh = False
+        while time.monotonic() < deadline:
+            diagnostic_version = self._diagnostic_versions.get(uri)
+            fresh = self._diagnostic_generations.get(uri, 0) > generation and (
+                diagnostic_version is None or diagnostic_version >= document_version
+            )
+            if fresh:
+                break
+            time.sleep(0.05)
+        return self._evidence(
+            path,
+            diagnostics=self._diagnostics.get(uri, []) if fresh else [],
+            diagnosticsFresh=fresh,
+            stderr=self.stderr,
+        )
+
+    def text_request(self, method: str, path: Path, line: int, character: int) -> dict[str, Any]:
+        uri = self.open_document(path)
+        response = self.request(
+            method,
+            {"textDocument": {"uri": uri}, "position": {"line": line, "character": character}},
+        )
+        return self._evidence(path, response=response)
+
+    def references(self, path: Path, line: int, character: int) -> dict[str, Any]:
+        uri = self.open_document(path)
+        response = self.request(
+            "textDocument/references",
+            {
+                "textDocument": {"uri": uri},
+                "position": {"line": line, "character": character},
+                "context": {"includeDeclaration": True},
+            },
+        )
+        return self._evidence(path, response=response)
+
+    def document_symbols(self, path: Path) -> dict[str, Any]:
+        uri = self.open_document(path)
+        response = self.request("textDocument/documentSymbol", {"textDocument": {"uri": uri}})
+        return self._evidence(path, response=response)
+
+    def _evidence(self, path: Path, **payload: object) -> dict[str, Any]:
+        return {
+            "server": self.server,
+            "path": str(path),
+            **payload,
+            "authoritative": False,
+            "compatibilityAdapter": True,
+        }
+
+    def close(self) -> None:
+        if self.process.poll() is not None:
+            return
+        try:
+            self.request("shutdown", None, timeout=2)
+            self.notify("exit", {})
+            self.process.wait(timeout=2)
+        except Exception:
+            self.process.kill()
+            self.process.wait(timeout=2)
+
+
+class McpServer:
+    """Expose a deliberately small, read-only MCP tool surface."""
+
+    def __init__(self, server: str, root: Path) -> None:
+        self.server = server
+        self.root = root.resolve(strict=True)
+        self.session: LspSession | None = None
+
+    def _session(self) -> LspSession:
+        if self.session is None or self.session.process.poll() is not None:
+            self.session = LspSession(self.server, self.root)
+        return self.session
+
+    def _path(self, value: object) -> Path:
+        if not isinstance(value, str) or not value:
+            raise AdapterError("path is required")
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = self.root / candidate
+        path = candidate.resolve(strict=True)
+        try:
+            path.relative_to(self.root)
+        except ValueError as error:
+            raise AdapterError(f"document escapes repository root: {value}") from error
+        expected = ".cue" if self.server == "cue-lsp" else ".go"
+        if path.suffix != expected:
+            raise AdapterError(f"{self.server} accepts only {expected} documents: {value}")
+        return path
+
+    @staticmethod
+    def _position(arguments: Mapping[str, Any], key: str) -> int:
+        value = arguments.get(key, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise AdapterError(f"{key} must be a non-negative integer")
+        return value
+
+    def tools(self) -> list[dict[str, Any]]:
+        path_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }
+        position_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "path": {"type": "string"},
+                "line": {"type": "integer", "minimum": 0, "default": 0},
+                "character": {"type": "integer", "minimum": 0, "default": 0},
+            },
+            "required": ["path"],
+        }
+        annotations = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
+        return [
+            {
+                "name": "diagnostics",
+                "description": f"Return advisory diagnostics from {self.server}.",
+                "inputSchema": path_schema,
+                "annotations": annotations,
+            },
+            {
+                "name": "hover",
+                "description": f"Return advisory hover evidence from {self.server}.",
+                "inputSchema": position_schema,
+                "annotations": annotations,
+            },
+            {
+                "name": "definition",
+                "description": f"Return advisory definition evidence from {self.server}.",
+                "inputSchema": position_schema,
+                "annotations": annotations,
+            },
+            {
+                "name": "references",
+                "description": f"Return advisory reference evidence from {self.server}.",
+                "inputSchema": position_schema,
+                "annotations": annotations,
+            },
+            {
+                "name": "document_symbols",
+                "description": f"Return advisory document symbols from {self.server}.",
+                "inputSchema": path_schema,
+                "annotations": annotations,
+            },
+        ]
+
+    def call(self, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        path = self._path(arguments.get("path"))
+        session = self._session()
+        line = self._position(arguments, "line")
+        character = self._position(arguments, "character")
+        if name == "diagnostics":
+            result = session.diagnostics(path)
+        elif name == "hover":
+            result = session.text_request("textDocument/hover", path, line, character)
+        elif name == "definition":
+            result = session.text_request("textDocument/definition", path, line, character)
+        elif name == "references":
+            result = session.references(path, line, character)
+        elif name == "document_symbols":
+            result = session.document_symbols(path)
+        else:
+            raise AdapterError(f"unknown MCP tool: {name}")
+        return {
+            "content": [{"type": "text", "text": json.dumps(result, sort_keys=True, indent=2)}],
+            "structuredContent": result,
+        }
+
+    def handle(self, message: Mapping[str, Any]) -> dict[str, Any] | None:
+        method = message.get("method")
+        request_id = message.get("id")
+        if method == "initialize":
+            self._session()
+            params = message.get("params") or {}
+            protocol = params.get("protocolVersion", "2025-06-18") if isinstance(params, dict) else "2025-06-18"
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "protocolVersion": protocol,
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": f"code-intel-{self.server}", "version": MCP_SERVER_VERSION},
+                    "instructions": (
+                        f"Temporary read-only {self.server} evidence adapter. Results are advisory, "
+                        "non-authoritative, and do not hydrate the canonical context graph."
+                    ),
+                },
+            }
+        if method in {"notifications/initialized", "notifications/cancelled"}:
+            return None
+        if method == "ping":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {}}
+        if method == "tools/list":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": self.tools()}}
+        if method == "tools/call":
+            params = message.get("params") or {}
+            name = params.get("name")
+            arguments = params.get("arguments") or {}
+            if not isinstance(name, str) or not isinstance(arguments, dict):
+                raise AdapterError("invalid tools/call parameters")
+            return {"jsonrpc": "2.0", "id": request_id, "result": self.call(name, arguments)}
+        if method == "resources/list":
+            return {"jsonrpc": "2.0", "id": request_id, "result": {"resources": []}}
+        if request_id is None:
+            return None
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": f"method not found: {method}"},
+        }
+
+    def serve(self) -> int:
+        try:
+            for line in sys.stdin:
+                if not line.strip():
+                    continue
+                message: object = None
+                try:
+                    message = json.loads(line)
+                    if not isinstance(message, dict):
+                        raise AdapterError("MCP message must be an object")
+                    response = self.handle(message)
+                except Exception as error:
+                    request_id = message.get("id") if isinstance(message, dict) else None
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32603, "message": f"{type(error).__name__}: {error}"[:1000]},
+                    }
+                if response is not None:
+                    sys.stdout.write(json.dumps(response, sort_keys=True, separators=(",", ":")) + "\n")
+                    sys.stdout.flush()
+            return 0
+        finally:
+            if self.session is not None:
+                self.session.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("server", choices=("cue-lsp", "gopls"))
+    parser.add_argument("--root", type=Path, default=Path.cwd())
+    args = parser.parse_args()
+    return McpServer(args.server, args.root).serve()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

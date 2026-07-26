@@ -1,0 +1,26 @@
+{
+  "schema": "factory.plugin-bundle.code-intel.lsp.lua.v1",
+  "id": "lua-language-server",
+  "reference": true,
+  "authority": false,
+  "language": "lua",
+  "provider": "lua-language-server",
+  "rootPatterns": [
+    ".luarc.json",
+    ".git"
+  ],
+  "workspace": {
+    "checkThirdParty": false,
+    "library": [
+      ".codex/plugins/code-intel/reference/types/nvim",
+      ".codex/plugins/code-intel/reference/types/wezterm"
+    ]
+  },
+  "diagnostics": {
+    "knownGlobals": [
+      "vim",
+      "wezterm"
+    ],
+    "authority": "evidence-only"
+  }
+}

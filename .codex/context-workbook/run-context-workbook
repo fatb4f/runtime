@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+workbook_root=$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)
+repo_root=$(CDPATH= cd -- "$workbook_root/../.." && pwd -P)
+
+if [ -n "${CONTEXT_WORKBOOK_PYTHON:-}" ]; then
+	exec "$CONTEXT_WORKBOOK_PYTHON" "$workbook_root/workbook_cli.py" "$@"
+fi
+if [ -x "$repo_root/.venv/bin/python" ]; then
+	exec "$repo_root/.venv/bin/python" "$workbook_root/workbook_cli.py" "$@"
+fi
+if command -v uv >/dev/null 2>&1; then
+	exec uv run --project "$repo_root" --no-sync -- \
+		python "$workbook_root/workbook_cli.py" "$@"
+fi
+exec python3 "$workbook_root/workbook_cli.py" "$@"

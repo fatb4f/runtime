@@ -1,0 +1,60 @@
+{
+  "hypotheses": {
+    "hypothesis.issue-54": {
+      "kind": "implementation-objective",
+      "statement": "The reactive context workbook is the relevant implementation surface.",
+      "state": "accepted",
+      "evidenceIDs": [
+        "evidence.prompt"
+      ],
+      "confidence": 1.0,
+      "derivedBy": "dspy.context-establishment"
+    }
+  },
+  "fragments": {
+    "ids": [
+      "resolver.lifecycle",
+      "resolver.context-workbook",
+      "code-intel.provider-routing"
+    ],
+    "reason": "The request spans the resolver lifecycle, canonical workbook, and code-intel evidence boundary.",
+    "evidenceIDs": [
+      "evidence.prompt"
+    ]
+  },
+  "files": {
+    "ids": [
+      ".codex/context-model/workbook.cue",
+      ".codex/context-workbook/context-workbook.py",
+      ".codex/plugins/code-intel/reference/lsp/provider-routing.json"
+    ],
+    "reason": "These files define the bounded runtime contract, reactive program, and provider evidence.",
+    "evidenceIDs": [
+      "evidence.prompt"
+    ]
+  },
+  "providers": {
+    "ids": [
+      "cue-lsp"
+    ],
+    "reason": "The selected mutation surface is CUE-backed.",
+    "evidenceIDs": [
+      "evidence.prompt"
+    ]
+  },
+  "workflows": {
+    "ids": [
+      "context-establishment"
+    ],
+    "reason": "The canonical workflow establishes and projects context.",
+    "evidenceIDs": [
+      "evidence.prompt"
+    ]
+  },
+  "gaps": {},
+  "conflicts": {},
+  "sufficiencyState": "sufficient",
+  "sufficiencyReasons": [
+    "The objective, evidence sources, and bounded mutation files are explicit."
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "schema": "factory.plugin-bundle.code-intel.tool.selene.v1",
+  "id": "selene",
+  "authority": false,
+  "evidenceOnly": true,
+  "tool": "selene",
+  "configGlobs": [
+    "chezmoi/private_dot_config/**/dot_selene.toml"
+  ]
+}

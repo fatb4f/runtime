@@ -1,0 +1,22 @@
+{
+  "schema": "factory.plugin-bundle.code-intel.lua-first.diagnostic-map.v1",
+  "reference": true,
+  "authority": false,
+  "diagnosticsAreAuthority": false,
+  "providers": {
+    "lua-language-server": {
+      "severityMap": {
+        "Error": "review-required",
+        "Warning": "review-evidence",
+        "Information": "context-evidence",
+        "Hint": "context-evidence"
+      }
+    },
+    "cue-lsp": {
+      "severityMap": {
+        "Error": "contract-evidence",
+        "Warning": "contract-review-evidence"
+      }
+    }
+  }
+}

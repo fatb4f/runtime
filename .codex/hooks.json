@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'd=$PWD; while [ \"$d\" != / ]; do p=$d/.codex/plugins/agent-context-resolver/scripts/agent-context-resolver-hook; [ -f \"$p\" ] && exec sh \"$p\"; d=${d%/*}; done; exit 0'",
+            "timeout": 10,
+            "statusMessage": "Routing dotfiles context"
+          }
+        ]
+      }
+    ]
+  }
+}

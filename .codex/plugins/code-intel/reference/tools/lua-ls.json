@@ -1,0 +1,8 @@
+{
+  "schema": "factory.plugin-bundle.code-intel.tool.lua-ls.v1",
+  "id": "lua-ls",
+  "authority": false,
+  "evidenceOnly": true,
+  "tool": "lua-language-server",
+  "reference": "reference/lsp/lua-language-server.json"
+}

@@ -1,0 +1,30 @@
+{
+  "schema": "factory.plugin-bundle.code-intel.mcp.server-manifest.v1",
+  "reference": true,
+  "authority": false,
+  "servers": [
+    {
+      "id": "factory-cue",
+      "kind": "stdio",
+      "adapter": "host-provided",
+      "defaultReadOnly": true,
+      "description": "CUE CLI/LSP bridge declarations for contract inspection and export.",
+      "tools": [
+        "cue.vet",
+        "cue.export",
+        "cue.eval"
+      ]
+    },
+    {
+      "id": "factory-ripgrep",
+      "kind": "stdio",
+      "adapter": "host-provided",
+      "defaultReadOnly": true,
+      "description": "Repository-local search declarations for dotfiles code-intel workflows.",
+      "tools": [
+        "rg.search",
+        "rg.files"
+      ]
+    }
+  ]
+}

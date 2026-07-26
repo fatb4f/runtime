@@ -1,0 +1,20 @@
+{
+  "schema": "factory.plugin-bundle.code-intel.lsp.cue.v1",
+  "id": "cue-lsp",
+  "reference": true,
+  "authority": false,
+  "language": "cue",
+  "command": "cue-lsp",
+  "rootPatterns": [
+    "cue.mod",
+    "*.cue"
+  ],
+  "workspaceFolders": [
+    "contracts/code-intel"
+  ],
+  "settings": {
+    "diagnostics": true,
+    "format": true,
+    "authority": "evidence-only"
+  }
+}

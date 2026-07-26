@@ -1,0 +1,23 @@
+{
+  "name": "code-intel",
+  "version": "0.2.0+codex.20260722182120",
+  "description": "Read-only code-intelligence evidence, including temporary CUE and Go language-server adapters.",
+  "author": {
+    "name": "fatb4f"
+  },
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Code Intel",
+    "shortDescription": "Supplies typed read-only code-intelligence evidence.",
+    "longDescription": "Supplies provider routing, type overlays, tool metadata, workflow references, and temporary read-only CUE/gopls adapters as evidence to the CUE-rooted Marimo context workbook.",
+    "developerName": "fatb4f",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read"
+    ],
+    "defaultPrompt": [
+      "Load bounded code-intelligence evidence for this dotfiles task; treat bundled language-server adapters as temporary and non-authoritative."
+    ]
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "schema": "codex-profiler-golden.v0",
+  "evidence_contract": {
+    "file_mtime_used": false,
+    "untimestamped_rows_included": false,
+    "window": "event_timestamp_half_open"
+  },
+  "case_ids": [
+    "incremental-preferred-over-cumulative",
+    "cumulative-pre-window-baseline",
+    "counter-reset",
+    "duplicate-incremental-record",
+    "event-timestamp-half-open-filter",
+    "repository-attribution-from-session-metadata"
+  ],
+  "totals": {
+    "cases": 6,
+    "selected_lines": 6,
+    "token_counter_resets": 1,
+    "token_discrepancies": 1,
+    "token_events_counted": 2,
+    "tokens_total": 100
+  }
+}

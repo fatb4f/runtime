@@ -1,0 +1,10 @@
+interface:
+  display_name: "CUE Authoring"
+  short_description: "Author and validate robust CUE models"
+  default_prompt: "Use $cue to diagnose and validate this CUE model with advisory language-server evidence and concrete package gates."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "cue_lsp"
+      description: "Read-only CUE language-server evidence"
+      transport: "stdio"

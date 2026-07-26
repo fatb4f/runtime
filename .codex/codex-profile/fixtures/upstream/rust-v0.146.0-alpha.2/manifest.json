@@ -1,0 +1,118 @@
+{
+  "repository": "openai/codex",
+  "tag": "rust-v0.146.0-alpha.2",
+  "files": {
+    "codex-rs/core/src/compact_token_budget.rs": {
+      "sha256": "a552b51f00dea991002bfa8868ee7f31a4a81d28bd7536c29ca1ae5fea858552",
+      "required_fragments": [
+        "run_pre_compact_hooks",
+        "start_new_context_window",
+        "run_post_compact_hooks"
+      ]
+    },
+    "codex-rs/core/src/hook_runtime.rs": {
+      "sha256": "4c752df1661294643ef956381fc1ec51e04ea6c29df8297c6ddf56506cef7d44",
+      "required_fragments": [
+        "flush_rollout",
+        "PreCompactHookOutcome",
+        "PostCompactHookOutcome"
+      ]
+    },
+    "codex-rs/core/src/session/context_window.rs": {
+      "sha256": "fc24cf69a77b9fe1f0e615c11ad81d35e8b698dd5d717ddfd245be053d8becef",
+      "required_fragments": [
+        "active_context_tokens",
+        "AutoCompactTokenLimitScope::BodyAfterPrefix",
+        "full_context_window_limit_reached"
+      ]
+    },
+    "codex-rs/core/src/state/auto_compact_window.rs": {
+      "sha256": "61dd15e182e64fd43883098522854cdc2c6365d8d94d0f2408a03f6da7db6731",
+      "required_fragments": [
+        "new_context_window_requested",
+        "prefill_input_tokens"
+      ]
+    },
+    "codex-rs/hooks/src/events/compact.rs": {
+      "sha256": "412c204320daed94460c2b974c91d4e7525fa3bb7239addfb016d21232d541e6",
+      "required_fragments": [
+        "pub struct PreCompactRequest",
+        "pub struct PostCompactRequest",
+        "pub trigger: String"
+      ]
+    },
+    "codex-rs/hooks/src/events/session_end.rs": {
+      "sha256": "0382d1eb583d4311c4257fc25c662ac924f29521e13b26e638d43dec5937c388",
+      "required_fragments": [
+        "SESSION_END_DEFAULT_TIMEOUT_SEC",
+        "SESSION_END_MAX_TIMEOUT_SEC",
+        "pub struct SessionEndRequest"
+      ]
+    },
+    "codex-rs/hooks/src/events/session_start.rs": {
+      "sha256": "76dec1a3d612c1587063e08da7aabf2b71b82735ae61a8e32a38689b40e0022a",
+      "required_fragments": [
+        "pub enum SessionStartSource",
+        "Compact",
+        "additional_contexts"
+      ]
+    },
+    "codex-rs/hooks/src/events/stop.rs": {
+      "sha256": "78c8434fc8ad329cd157717d1326aace56bbab22671a14d87ca1c8f8d7bb3bf0",
+      "required_fragments": [
+        "pub struct StopRequest",
+        "pub should_block: bool",
+        "continuation_fragments"
+      ]
+    },
+    "codex-rs/hooks/src/output_spill.rs": {
+      "sha256": "86d63b4556a9042c570f33168ebeea285460edd5ce9a9302fa15cb60a6ee24d4",
+      "required_fragments": [
+        "DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT",
+        "maybe_spill_additional_contexts",
+        "spilled_hook_output_preview"
+      ]
+    },
+    "codex-rs/hooks/src/schema.rs": {
+      "sha256": "c2e5cd6aec7c1a645f9b949e95a1d1bba4602d056d4ceb3df816c9d7f8412a9e",
+      "required_fragments": [
+        "pub(crate) struct PreCompactCommandInput",
+        "pub(crate) struct PostCompactCommandInput",
+        "pub(crate) struct SessionStartCommandInput",
+        "pub(crate) struct SessionEndCommandInput",
+        "pub(crate) struct StopCommandInput",
+        "serde(deny_unknown_fields)"
+      ]
+    },
+    "codex-rs/protocol/src/compacted_item.rs": {
+      "sha256": "df8d4739106ad0b44e7715bed71c0e8a40e27bedd179320de8a8931c22839246",
+      "required_fragments": [
+        "window_number",
+        "first_window_id",
+        "previous_window_id",
+        "window_id"
+      ]
+    },
+    "codex-rs/protocol/src/protocol.rs": {
+      "sha256": "404133bd3452315e33331228b5ab4b90d91ffca6850ea8613154d61203c1b46e",
+      "required_fragments": [
+        "pub struct TokenUsage",
+        "pub total_token_usage: TokenUsage",
+        "pub last_token_usage: TokenUsage",
+        "pub struct RateLimitSnapshot",
+        "pub history_base: Option<HistoryPosition>",
+        "pub context_window: Option<SessionContextWindow>",
+        "pub struct CompactedItem"
+      ]
+    },
+    "codex-rs/rollout/src/policy.rs": {
+      "sha256": "ad6c7c408664069dbe2c27b05519add7ee0252a084e6e5e1d2b5ae3b6efb8524",
+      "required_fragments": [
+        "is_persisted_rollout_item",
+        "EventMsg::TokenCount",
+        "EventMsg::HookStarted(_)",
+        "EventMsg::HookCompleted(_)"
+      ]
+    }
+  }
+}
