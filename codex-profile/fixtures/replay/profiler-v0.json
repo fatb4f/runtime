@@ -1,0 +1,59 @@
+{
+  "schema": "codex-profiler-replay.v0",
+  "window": {
+    "since": "2026-07-18T00:00:00Z",
+    "until": "2026-07-19T00:00:00Z"
+  },
+  "cases": [
+    {
+      "id": "incremental-preferred-over-cumulative",
+      "events": [
+        {"timestamp": "2026-07-17T23:00:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 100, "input_tokens": 80, "cached_input_tokens": 0, "output_tokens": 20, "reasoning_output_tokens": 0}}}},
+        {"timestamp": "2026-07-18T01:00:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 150, "input_tokens": 120, "cached_input_tokens": 0, "output_tokens": 30, "reasoning_output_tokens": 0}, "last_token_usage": {"total_tokens": 50, "input_tokens": 40, "cached_input_tokens": 0, "output_tokens": 10, "reasoning_output_tokens": 0}}}}
+      ],
+      "expected": {"selected_lines": 1, "tokens_total": 50, "token_events_counted": 1, "token_discrepancies": 0, "token_counter_resets": 0, "token_missing_baseline": 0}
+    },
+    {
+      "id": "cumulative-pre-window-baseline",
+      "events": [
+        {"timestamp": "2026-07-17T23:00:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 100, "input_tokens": 80, "cached_input_tokens": 0, "output_tokens": 20, "reasoning_output_tokens": 0}}}},
+        {"timestamp": "2026-07-18T01:00:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 150, "input_tokens": 120, "cached_input_tokens": 0, "output_tokens": 30, "reasoning_output_tokens": 0}}}}
+      ],
+      "expected": {"selected_lines": 1, "tokens_total": 50, "token_events_counted": 1, "token_discrepancies": 0, "token_counter_resets": 0, "token_missing_baseline": 0}
+    },
+    {
+      "id": "counter-reset",
+      "events": [
+        {"timestamp": "2026-07-17T23:00:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 100, "input_tokens": 80, "cached_input_tokens": 0, "output_tokens": 20, "reasoning_output_tokens": 0}}}},
+        {"timestamp": "2026-07-18T01:00:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 40, "input_tokens": 30, "cached_input_tokens": 0, "output_tokens": 10, "reasoning_output_tokens": 0}}}}
+      ],
+      "expected": {"selected_lines": 1, "tokens_total": 0, "token_events_counted": 0, "token_discrepancies": 0, "token_counter_resets": 1, "token_missing_baseline": 0}
+    },
+    {
+      "id": "duplicate-incremental-record",
+      "events": [
+        {"timestamp": "2026-07-17T23:00:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 100, "input_tokens": 80, "cached_input_tokens": 0, "output_tokens": 20, "reasoning_output_tokens": 0}}}},
+        {"timestamp": "2026-07-18T01:00:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"total_tokens": 100, "input_tokens": 80, "cached_input_tokens": 0, "output_tokens": 20, "reasoning_output_tokens": 0}, "last_token_usage": {"total_tokens": 50, "input_tokens": 40, "cached_input_tokens": 0, "output_tokens": 10, "reasoning_output_tokens": 0}}}}
+      ],
+      "expected": {"selected_lines": 1, "tokens_total": 0, "token_events_counted": 0, "token_discrepancies": 1, "token_counter_resets": 0, "token_missing_baseline": 0}
+    },
+    {
+      "id": "event-timestamp-half-open-filter",
+      "events": [
+        {"timestamp": "2026-07-17T23:59:59Z", "type": "message"},
+        {"timestamp": "2026-07-18T00:00:00Z", "type": "message"},
+        {"timestamp": "2026-07-19T00:00:00Z", "type": "message"}
+      ],
+      "expected": {"selected_lines": 1, "tokens_total": 0, "token_events_counted": 0, "token_discrepancies": 0, "token_counter_resets": 0, "token_missing_baseline": 0}
+    },
+    {
+      "id": "repository-attribution-from-session-metadata",
+      "events": [
+        {"timestamp": "2026-07-17T20:00:00Z", "type": "session_meta", "payload": {"cwd": "/home/_404/src/dotfiles"}},
+        {"timestamp": "2026-07-18T01:00:00Z", "type": "message"}
+      ],
+      "repository": {"matches": "dotfiles", "rejects": "other-repository"},
+      "expected": {"selected_lines": 1, "tokens_total": 0, "token_events_counted": 0, "token_discrepancies": 0, "token_counter_resets": 0, "token_missing_baseline": 0}
+    }
+  ]
+}

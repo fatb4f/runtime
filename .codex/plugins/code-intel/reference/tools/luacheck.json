@@ -1,8 +1,0 @@
-{
-  "schema": "factory.plugin-bundle.code-intel.tool.luacheck.v1",
-  "id": "luacheck",
-  "authority": false,
-  "evidenceOnly": true,
-  "tool": "luacheck",
-  "configGlobs": []
-}
