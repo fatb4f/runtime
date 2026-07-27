@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import (
+    AwareDatetime,
     AfterValidator,
     BaseModel,
     ConfigDict,
@@ -17,6 +18,7 @@ from pydantic import (
 HANDOFF_MAX_BYTES = 1024 * 1024
 MAX_OPERATIONS = 2048
 MAX_FAILURES = 256
+MAX_VALIDATION = 256
 MAX_SOURCE_EVENTS = 64
 MAX_COMMAND_BYTES = 32 * 1024
 MAX_ARGV = 256
@@ -50,14 +52,12 @@ class DerivedValue(ClosedModel):
     source_events: Annotated[list[EventIndex], Field(alias="sourceEvents", max_length=MAX_SOURCE_EVENTS)]
     derivation: Literal[
         "latest-user-request",
-        "explicit-objective",
         "explicit-completed",
         "explicit-current-operation",
         "explicit-next-operation",
         "explicit-completion-criteria",
         "explicit-open-question",
         "structured-open-question",
-        "git-staged-change",
     ]
 
     @model_validator(mode="after")
@@ -128,23 +128,46 @@ class Operation(ClosedModel):
     kind: Literal["assistant", "tool", "shell"]
     event: EventIndex
     result_event: EventIndex | None = Field(default=None, alias="resultEvent")
-    timestamp: NonEmpty | None = None
+    timestamp: AwareDatetime | None = None
     text: Text | None = None
     tool: NonEmpty | None = None
     argv: Annotated[list[Argument], Field(max_length=MAX_ARGV)] | None = None
     command: Text | None = None
+    input: Text | None = None
     exit_code: StrictInt | None = Field(default=None, alias="exitCode")
     status: Literal["pending", "succeeded", "failed"]
 
     @model_validator(mode="after")
     def operation_shape(self) -> "Operation":
-        if self.argv is not None and self.command is not None:
-            raise ValueError("command evidence cannot contain both argv and command")
+        if sum(value is not None for value in (self.argv, self.command, self.input)) > 1:
+            raise ValueError("operation evidence must use only one of argv, command, or input")
         if self.kind == "assistant":
-            if self.text is None or self.tool is not None:
+            if (
+                self.text is None
+                or self.tool is not None
+                or self.argv is not None
+                or self.command is not None
+                or self.input is not None
+                or self.exit_code is not None
+                or self.result_event is not None
+                or self.status != "succeeded"
+            ):
                 raise ValueError("assistant operations require text only")
-        elif self.tool is None:
-            raise ValueError("tool and shell operations require a tool name")
+            return self
+        if self.tool is None or self.text is not None:
+            raise ValueError("tool and shell operations require a tool name and no text")
+        if self.status == "pending":
+            if self.result_event is not None or self.exit_code is not None:
+                raise ValueError("pending operations cannot have result evidence")
+        elif self.result_event is None:
+            raise ValueError("completed operations require resultEvent")
+        if self.kind == "shell" and self.status != "pending":
+            if self.exit_code is None:
+                raise ValueError("completed shell operations require exitCode")
+            if self.status == "succeeded" and self.exit_code != 0:
+                raise ValueError("succeeded shell operations require exitCode zero")
+            if self.status == "failed" and self.exit_code == 0:
+                raise ValueError("failed shell operations require nonzero exitCode")
         return self
 
 
@@ -152,17 +175,18 @@ class Failure(ClosedModel):
     kind: Literal["tool", "shell"]
     tool: NonEmpty
     event: EventIndex
-    timestamp: NonEmpty | None = None
+    timestamp: AwareDatetime | None = None
     argv: Annotated[list[Argument], Field(max_length=MAX_ARGV)] | None = None
     command: Text | None = None
+    input: Text | None = None
     exit_code: StrictInt | None = Field(default=None, alias="exitCode")
     error: StrictStr | None = None
     truncated: bool = False
 
     @model_validator(mode="after")
     def failure_shape(self) -> "Failure":
-        if self.argv is not None and self.command is not None:
-            raise ValueError("failure cannot contain both argv and command")
+        if sum(value is not None for value in (self.argv, self.command, self.input)) > 1:
+            raise ValueError("failure evidence must use only one of argv, command, or input")
         if self.kind == "shell":
             if self.exit_code is None or self.exit_code == 0 or self.error is not None:
                 raise ValueError("shell failures require a nonzero exitCode")
@@ -171,6 +195,37 @@ class Failure(ClosedModel):
         if self.error is not None and len(self.error.encode("utf-8")) > MAX_ERROR_BYTES:
             raise ValueError("retained error exceeds its byte bound")
         return self
+
+
+class ValidationBase(ClosedModel):
+    operation_event: EventIndex = Field(alias="operationEvent")
+    result_event: EventIndex = Field(alias="resultEvent")
+    status: Literal["passed", "failed"]
+    exit_code: StrictInt = Field(alias="exitCode")
+
+    @model_validator(mode="after")
+    def result_shape(self) -> "ValidationBase":
+        if self.result_event < self.operation_event:
+            raise ValueError("validation resultEvent precedes operationEvent")
+        if (self.status == "passed") != (self.exit_code == 0):
+            raise ValueError("validation status disagrees with exitCode")
+        return self
+
+
+class TestValidation(ValidationBase):
+    kind: Literal["test"]
+    framework: Literal["pytest"]
+
+
+class QualificationValidation(ValidationBase):
+    kind: Literal["qualification"]
+    gate: Literal["handoff-help", "uv-lock-check", "uv-build", "uv-install"]
+
+
+ValidationResult = Annotated[
+    TestValidation | QualificationValidation,
+    Field(discriminator="kind"),
+]
 
 
 class Handoff(ClosedModel):
@@ -184,14 +239,67 @@ class Handoff(ClosedModel):
     next_operation: DerivedValue | None = Field(alias="nextOperation")
     completion_criteria: list[DerivedValue] = Field(alias="completionCriteria")
     operations: Annotated[list[Operation], Field(max_length=MAX_OPERATIONS)]
+    validation: Annotated[list[ValidationResult], Field(max_length=MAX_VALIDATION)]
     failures: Annotated[list[Failure], Field(max_length=MAX_FAILURES)]
     open_questions: list[DerivedValue] = Field(alias="openQuestions")
     diagnostics: list[Diagnostic]
 
     @model_validator(mode="after")
-    def aware_created_at(self) -> "Handoff":
+    def integrity(self) -> "Handoff":
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
             raise ValueError("createdAt must include a timezone")
+        first = self.session.first_event
+        last = self.session.last_event
+
+        def require_event(value: int, label: str) -> None:
+            if value < first or value > last:
+                raise ValueError(f"{label} is outside session bounds")
+
+        derived = [
+            *(([self.objective] if self.objective is not None else [])),
+            *self.completed,
+            *(([self.current_operation] if self.current_operation is not None else [])),
+            *(([self.next_operation] if self.next_operation is not None else [])),
+            *self.completion_criteria,
+            *self.open_questions,
+        ]
+        for item in derived:
+            for event in item.source_events:
+                require_event(event, "sourceEvent")
+        for operation in self.operations:
+            require_event(operation.event, "operation event")
+            if operation.result_event is not None:
+                require_event(operation.result_event, "operation resultEvent")
+                if operation.result_event < operation.event:
+                    raise ValueError("operation resultEvent precedes event")
+        if self.operations != sorted(
+            self.operations, key=lambda item: (item.event, item.result_event or -1)
+        ):
+            raise ValueError("operations must be chronological")
+        for failure in self.failures:
+            require_event(failure.event, "failure event")
+        if self.failures != sorted(self.failures, key=lambda item: item.event):
+            raise ValueError("failures must be chronological")
+        operation_results = {
+            (operation.event, operation.result_event): operation
+            for operation in self.operations
+            if operation.result_event is not None
+        }
+        for result in self.validation:
+            require_event(result.operation_event, "validation operationEvent")
+            require_event(result.result_event, "validation resultEvent")
+            operation = operation_results.get((result.operation_event, result.result_event))
+            if operation is None:
+                raise ValueError("validation result does not reference an operation")
+            if operation.kind != "shell" or operation.exit_code != result.exit_code:
+                raise ValueError("validation result disagrees with its operation")
+        if self.validation != sorted(
+            self.validation, key=lambda item: (item.operation_event, item.result_event)
+        ):
+            raise ValueError("validation results must be chronological")
+        for diagnostic in self.diagnostics:
+            if diagnostic.event_index is not None:
+                require_event(diagnostic.event_index, "diagnostic eventIndex")
         return self
 
 

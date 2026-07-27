@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import handoff.cli as cli_module
 from handoff.cli import create_handoff, main
 from handoff.rollout import RolloutError
 
@@ -53,6 +54,14 @@ def test_create_stages_and_atomically_publishes(repository: Path, tmp_path: Path
     assert document["schema"] == "codex.handoff.v0"
     assert document["createdAt"] == "2026-07-26T23:00:00Z"
     assert document["repository"]["staged"][0]["path"] == "tracked.txt"
+    assert document["completed"] == [
+        {
+            "derivation": "explicit-completed",
+            "sourceEvents": [2],
+            "value": "Added code",
+        }
+    ]
+    assert document["validation"] == []
     assert path.read_bytes().endswith(b"\n")
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
@@ -93,6 +102,7 @@ def test_cli_prints_only_path(
     repository: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
     rollout = write_rollout(tmp_path / "rollout.jsonl", repository, _events())
+    monkeypatch.setenv("CODEX_ROLLOUT_PATH", str(tmp_path / "missing.jsonl"))
     monkeypatch.chdir(repository)
     assert (
         main(
@@ -109,3 +119,36 @@ def test_cli_prints_only_path(
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out.strip().endswith("/handoff.json")
+
+
+def test_environment_rollout_is_used_without_flag(
+    repository: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rollout = write_rollout(tmp_path / "rollout.jsonl", repository, _events())
+    monkeypatch.setenv("CODEX_ROLLOUT_PATH", str(rollout))
+    path = create_handoff(
+        repository=repository,
+        output_root=tmp_path / "state",
+        now=datetime(2026, 7, 26, 23, 0, tzinfo=timezone.utc),
+    )
+    assert path.is_file()
+
+
+def test_publication_failure_removes_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+
+    def fail_replace(source: Path, destination: Path) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(cli_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        cli_module._publish(
+            state_root=state,
+            session_id="session-1",
+            data=b"{}\n",
+        )
+    directory = state / "session-1"
+    assert not list(directory.glob(".handoff.*"))
+    assert not (directory / "handoff.json").exists()

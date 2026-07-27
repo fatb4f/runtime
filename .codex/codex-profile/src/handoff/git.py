@@ -10,6 +10,7 @@ from .model import NumstatEntry, RepositoryProjection, StagedEntry
 
 _OID = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 _ALLOWED_MODES = {"000000", "100644", "100755", "120000"}
+_RENAME_LIMIT = "1000"
 
 
 class GitError(RuntimeError):
@@ -69,12 +70,16 @@ def resolve_metadata_repository(path: Path) -> Path:
 
 def begin_snapshot(repository: Path) -> GitCapture:
     root = resolve_repository(repository)
+    if _run(["diff", "--name-only", "--diff-filter=U", "-z"], cwd=root):
+        raise GitError("unmerged entry exists before staging")
     _run(["add", "-A"], cwd=root)
     tree_before = _oid_text(_run(["write-tree"], cwd=root), "index tree")
     status_data = _run(
         [
             "-c",
             "status.renames=true",
+            "-c",
+            f"diff.renameLimit={_RENAME_LIMIT}",
             "status",
             "--porcelain=v2",
             "-z",
@@ -110,6 +115,8 @@ def begin_snapshot(repository: Path) -> GitCapture:
             "-c",
             "diff.renames=true",
             "-c",
+            f"diff.renameLimit={_RENAME_LIMIT}",
+            "-c",
             "diff.external=",
             "diff",
             "--cached",
@@ -127,11 +134,16 @@ def begin_snapshot(repository: Path) -> GitCapture:
             "-c",
             "core.quotePath=false",
             "-c",
+            "diff.renames=true",
+            "-c",
+            f"diff.renameLimit={_RENAME_LIMIT}",
+            "-c",
             "diff.external=",
             "diff",
             "--cached",
             "--numstat",
             "-z",
+            "--find-renames",
             "--no-ext-diff",
             "--no-textconv",
         ],
@@ -165,7 +177,15 @@ def finish_snapshot(capture: GitCapture) -> RepositoryProjection:
     if head_after != capture.head:
         raise GitError("HEAD changed while handoff evidence was collected")
     final_data = _run(
-        ["-c", "status.renames=true", "status", "--porcelain=v2", "-z"],
+        [
+            "-c",
+            "status.renames=true",
+            "-c",
+            f"diff.renameLimit={_RENAME_LIMIT}",
+            "status",
+            "--porcelain=v2",
+            "-z",
+        ],
         cwd=capture.root,
     )
     _, final_entries = _parse_status(final_data, require_headers=False)

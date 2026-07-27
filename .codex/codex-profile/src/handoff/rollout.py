@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import heapq
 import json
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 from .git import GitError, resolve_metadata_repository
 from .model import (
@@ -13,8 +15,14 @@ from .model import (
     DerivedValue,
     Failure,
     MAX_ERROR_BYTES,
+    MAX_FAILURES,
+    MAX_OPERATIONS,
+    MAX_VALIDATION,
     Operation,
+    QualificationValidation,
     SessionProjection,
+    TestValidation,
+    ValidationResult,
 )
 
 _PROGRESS_HEADERS = {
@@ -26,7 +34,24 @@ _PROGRESS_HEADERS = {
     "Open questions": "open_questions",
 }
 _LIST_FIELDS = {"completed", "completion_criteria", "open_questions"}
+_SHELL_TOOLS = {"exec_command", "write_stdin", "wait"}
 _SHELL_RESULT = re.compile(r"^Process exited with code:?\s*(-?[0-9]+)\s*$", re.MULTILINE)
+_RFC3339 = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+_COMPOUND_SHELL = re.compile(r"[|;&><\r\n]")
+_PYTEST_COMMAND = re.compile(
+    r"^(?:(?:uv\s+run\s+)?(?:python(?:3(?:\.\d+)*)?\s+-m\s+)?pytest)(?:\s+.*)?$"
+)
+_QUALIFICATION_COMMANDS = (
+    ("handoff-help", re.compile(r"^(?:uv\s+run\s+)?handoff\s+--help$")),
+    ("uv-lock-check", re.compile(r"^uv\s+lock\s+--check$")),
+    ("uv-build", re.compile(r"^uv\s+build(?:\s+.*)?$")),
+    (
+        "uv-install",
+        re.compile(r"^(?:uv\s+sync(?:\s+.*)?|uv\s+pip\s+install(?:\s+.*)?)$"),
+    ),
+)
 
 
 class RolloutError(RuntimeError):
@@ -49,9 +74,51 @@ class RolloutProjection:
     next_operation: DerivedValue | None
     completion_criteria: list[DerivedValue]
     operations: list[Operation]
+    validation: list[ValidationResult]
     failures: list[Failure]
     open_questions: list[DerivedValue]
     diagnostics: list[Diagnostic]
+
+
+@dataclass(frozen=True)
+class _Call:
+    event: int
+    name: str
+    timestamp: datetime | None
+    command: str | None
+    argv: list[str] | None
+    input: str | None
+
+
+@dataclass
+class _Question:
+    call_id: str
+    event: int
+    text: str
+
+
+T = TypeVar("T")
+
+
+class _Newest(Generic[T]):
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._items: list[tuple[int, int, int, T]] = []
+        self._serial = 0
+        self.omitted = 0
+
+    def add(self, item: T, *, event: int, result_event: int | None = None) -> None:
+        entry = (event, result_event if result_event is not None else -1, self._serial, item)
+        self._serial += 1
+        if len(self._items) < self._limit:
+            heapq.heappush(self._items, entry)
+            return
+        if entry[:3] > self._items[0][:3]:
+            heapq.heapreplace(self._items, entry)
+        self.omitted += 1
+
+    def values(self) -> list[T]:
+        return [entry[3] for entry in sorted(self._items)]
 
 
 def resolve_rollout(
@@ -66,7 +133,7 @@ def resolve_rollout(
             raise RolloutError(f"rollout does not exist: {path}")
         return _admit_metadata(path, repository)
 
-    root = (codex_home or Path(os.environ.get("CODEX_HOME", Path.home() / ".local/share/codex")))
+    root = codex_home or Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
     sessions = root.expanduser().resolve() / "sessions"
     candidates: list[tuple[int, AdmittedRollout]] = []
     if sessions.is_dir():
@@ -131,41 +198,157 @@ def _admit_metadata(path: Path, repository: Path) -> AdmittedRollout:
 
 
 def project_rollout(admitted: AdmittedRollout) -> RolloutProjection:
-    data = admitted.path.read_bytes()
-    complete_lines, trailing = _complete_lines(data)
-    if not complete_lines:
-        raise RolloutError("rollout contains no complete events")
-    events: list[dict[str, Any]] = []
-    for index, raw in enumerate(complete_lines):
-        try:
-            value = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise RolloutError(f"malformed complete rollout record at event {index}") from error
-        if not isinstance(value, dict):
-            raise RolloutError(f"rollout event {index} is not an object")
-        events.append(value)
-
-    metadata = _metadata_from_events(events, admitted)
+    operations = _Newest[Operation](MAX_OPERATIONS)
+    failures = _Newest[Failure](MAX_FAILURES)
+    validation = _Newest[ValidationResult](MAX_VALIDATION)
     diagnostics: list[Diagnostic] = []
+    calls: dict[str, _Call] = {}
+    seen_calls: set[str] = set()
+    seen_results: set[str] = set()
+    questions: list[_Question] = []
+    metadata: set[tuple[str, str, str | None]] = set()
+    latest_user: tuple[int, str] | None = None
+    cue_index: int | None = None
+    cues: dict[str, list[str]] = {}
+    event_count = 0
+    trailing = False
+
+    with admitted.path.open("rb") as handle:
+        for raw in handle:
+            if not raw.endswith(b"\n"):
+                trailing = True
+                break
+            raw = raw[:-1]
+            if raw.endswith(b"\r"):
+                raw = raw[:-1]
+            index = event_count
+            event_count += 1
+            try:
+                event = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise RolloutError(f"malformed complete rollout record at event {index}") from error
+            if not isinstance(event, dict):
+                raise RolloutError(f"rollout event {index} is not an object")
+            timestamp = _timestamp(event, index)
+
+            if event.get("type") == "session_meta":
+                _record_metadata(metadata, event, index)
+
+            user_text = _user_text(event)
+            if user_text is not None:
+                latest_user = (index, user_text)
+                cue_index, cues = None, {}
+                questions = [question for question in questions if question.event >= index]
+
+            assistant_text = _assistant_text(event)
+            if assistant_text is not None:
+                operation = Operation(
+                    kind="assistant",
+                    event=index,
+                    timestamp=timestamp,
+                    text=assistant_text,
+                    status="succeeded",
+                )
+                operations.add(operation, event=index)
+                parsed = _parse_cues(assistant_text)
+                if parsed and latest_user is not None and index > latest_user[0]:
+                    cue_index, cues = index, parsed
+
+            payload = event.get("payload")
+            if event.get("type") != "response_item" or not isinstance(payload, dict):
+                continue
+            payload_type = payload.get("type")
+            if payload_type in {"function_call", "custom_tool_call"}:
+                call_id = payload.get("call_id")
+                name = payload.get("name")
+                if not isinstance(call_id, str) or not call_id:
+                    raise RolloutError(f"tool call at event {index} has no call_id")
+                if not isinstance(name, str) or not name:
+                    raise RolloutError(f"tool call at event {index} has no name")
+                if call_id in seen_calls:
+                    raise RolloutError(f"duplicate tool call_id at event {index}: {call_id}")
+                seen_calls.add(call_id)
+                if payload_type == "function_call":
+                    arguments = _arguments(payload.get("arguments"))
+                    command, argv = _command_evidence(arguments)
+                    input_value = None
+                    if name == "request_user_input":
+                        for text in _question_texts(arguments):
+                            questions.append(_Question(call_id=call_id, event=index, text=text))
+                else:
+                    command, argv = None, None
+                    input_value = _custom_input(payload.get("input"))
+                calls[call_id] = _Call(
+                    event=index,
+                    name=name,
+                    timestamp=timestamp,
+                    command=command,
+                    argv=argv,
+                    input=input_value,
+                )
+            elif payload_type in {"function_call_output", "custom_tool_call_output"}:
+                call_id = payload.get("call_id")
+                if not isinstance(call_id, str) or not call_id:
+                    raise RolloutError(f"tool result at event {index} has no call_id")
+                if call_id in seen_results:
+                    raise RolloutError(f"duplicate tool result at event {index}: {call_id}")
+                if call_id not in seen_calls or call_id not in calls:
+                    raise RolloutError(f"orphan tool result at event {index}: {call_id}")
+                seen_results.add(call_id)
+                call = calls.pop(call_id)
+                output = payload.get("output")
+                if _contains_answer(output):
+                    questions = [
+                        question for question in questions if question.call_id != call_id
+                    ]
+                operation, failure = _completed_operation(call, index, timestamp, output)
+                if not _is_self_invocation(call.command, call.argv):
+                    operations.add(
+                        operation, event=operation.event, result_event=operation.result_event
+                    )
+                    if failure is not None:
+                        failures.add(failure, event=failure.event)
+                    classified = _classify_validation(operation)
+                    if classified is not None:
+                        validation.add(
+                            classified,
+                            event=classified.operation_event,
+                            result_event=classified.result_event,
+                        )
+
+    if event_count == 0:
+        raise RolloutError("rollout contains no complete events")
+    _validate_metadata(metadata, admitted)
+    for call in calls.values():
+        if _is_self_invocation(call.command, call.argv):
+            continue
+        shell = call.name in _SHELL_TOOLS
+        operation = Operation(
+            kind="shell" if shell else "tool",
+            event=call.event,
+            timestamp=call.timestamp,
+            tool=call.name,
+            argv=call.argv,
+            command=call.command,
+            input=call.input,
+            status="pending",
+        )
+        operations.add(operation, event=operation.event)
+
     if trailing:
         diagnostics.append(
             Diagnostic(
                 code="rollout.trailing-record-incomplete",
                 detail="Excluded a non-newline-terminated trailing fragment.",
-                eventIndex=len(complete_lines),
             )
         )
-
-    operations, failures, pending_questions = _operation_trace(events)
-    cue_index, cues = _latest_progress_cues(events)
-    latest_user = _latest_user_message(events)
+    _omission_diagnostic(diagnostics, "operations", operations.omitted)
+    _omission_diagnostic(diagnostics, "failures", failures.omitted)
+    _omission_diagnostic(diagnostics, "validation", validation.omitted)
 
     objective: DerivedValue | None = None
-    if cue_index is not None and cues.get("objective"):
-        objective = _derived(cues["objective"][0], cue_index, "explicit-objective")
-    elif latest_user is not None:
-        index, text = latest_user
-        objective = _derived(text, index, "latest-user-request")
+    if latest_user is not None:
+        objective = _derived(latest_user[1], latest_user[0], "latest-user-request")
     else:
         diagnostics.append(Diagnostic(code="rollout.objective-unavailable"))
 
@@ -190,177 +373,109 @@ def project_rollout(admitted: AdmittedRollout) -> RolloutProjection:
     )
     if not criteria:
         diagnostics.append(Diagnostic(code="rollout.completion-criteria-unavailable"))
-
     open_questions = (
         [_derived(value, cue_index, "explicit-open-question") for value in cues.get("open_questions", [])]
         if cue_index is not None
         else []
     )
     existing_questions = {item.value for item in open_questions}
-    for index, question in pending_questions:
-        if question not in existing_questions:
-            open_questions.append(_derived(question, index, "structured-open-question"))
+    for question in questions:
+        if question.text not in existing_questions:
+            open_questions.append(
+                _derived(question.text, question.event, "structured-open-question")
+            )
+            existing_questions.add(question.text)
 
     return RolloutProjection(
         session=SessionProjection(
             rollout=str(admitted.path),
-            sessionId=metadata,
+            sessionId=admitted.session_id,
             firstEvent=0,
-            lastEvent=len(events) - 1,
+            lastEvent=event_count - 1,
         ),
         objective=objective,
         completed=completed,
         current_operation=current,
         next_operation=next_operation,
         completion_criteria=criteria,
-        operations=operations,
-        failures=failures,
+        operations=operations.values(),
+        validation=validation.values(),
+        failures=failures.values(),
         open_questions=open_questions,
         diagnostics=diagnostics,
     )
 
 
-def _complete_lines(data: bytes) -> tuple[list[bytes], bytes]:
-    if not data:
-        return [], b""
-    records = data.split(b"\n")
-    trailing = b""
-    if records[-1] == b"":
-        records.pop()
-    else:
-        trailing = records.pop()
-    complete = [record[:-1] if record.endswith(b"\r") else record for record in records]
-    return complete, trailing
+def _record_metadata(
+    values: set[tuple[str, str, str | None]], event: dict[str, Any], index: int
+) -> None:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        raise RolloutError(f"session_meta at event {index} is malformed")
+    session_id = payload.get("session_id") or payload.get("id")
+    cwd = payload.get("cwd")
+    rollout_id = payload.get("id")
+    if not isinstance(session_id, str) or not isinstance(cwd, str):
+        raise RolloutError(f"session_meta at event {index} is malformed")
+    values.add((session_id, cwd, rollout_id if isinstance(rollout_id, str) else None))
 
 
-def _metadata_from_events(events: list[dict[str, Any]], admitted: AdmittedRollout) -> str:
-    values: set[tuple[str, str, str | None]] = set()
-    for event in events:
-        if event.get("type") != "session_meta" or not isinstance(event.get("payload"), dict):
-            continue
-        payload = event["payload"]
-        session_id = payload.get("session_id") or payload.get("id")
-        cwd = payload.get("cwd")
-        rollout_id = payload.get("id")
-        if not isinstance(session_id, str) or not isinstance(cwd, str):
-            raise RolloutError("complete session_meta is malformed")
-        values.add((session_id, cwd, rollout_id if isinstance(rollout_id, str) else None))
+def _validate_metadata(
+    values: set[tuple[str, str, str | None]], admitted: AdmittedRollout
+) -> None:
     if len(values) != 1:
         raise RolloutError("complete session_meta records disagree")
     session_id, cwd, _ = next(iter(values))
     if session_id != admitted.session_id or Path(cwd) != admitted.metadata_cwd:
         raise RolloutError("snapshotted session_meta differs from preliminary admission")
-    return session_id
 
 
-def _operation_trace(
-    events: list[dict[str, Any]],
-) -> tuple[list[Operation], list[Failure], list[tuple[int, str]]]:
-    calls: dict[str, tuple[int, str, dict[str, Any], str | None]] = {}
-    results: dict[str, tuple[int, Any, str | None]] = {}
-    latest_user_index = max(
-        (index for index, event in enumerate(events) if _user_text(event) is not None),
-        default=-1,
+def _completed_operation(
+    call: _Call,
+    result_index: int,
+    result_timestamp: datetime | None,
+    output: Any,
+) -> tuple[Operation, Failure | None]:
+    exit_code, error = _explicit_result(output)
+    shell = exit_code is not None
+    failed = (exit_code is not None and exit_code != 0) or error is not None
+    operation = Operation(
+        kind="shell" if shell else "tool",
+        event=call.event,
+        resultEvent=result_index,
+        timestamp=call.timestamp,
+        tool=call.name,
+        argv=call.argv,
+        command=call.command,
+        input=call.input,
+        exitCode=exit_code,
+        status="failed" if failed else "succeeded",
     )
-    pending_questions: list[tuple[int, str]] = []
-
-    for index, event in enumerate(events):
-        payload = event.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        payload_type = payload.get("type")
-        if event.get("type") == "response_item" and payload_type == "function_call":
-            call_id = payload.get("call_id")
-            name = payload.get("name")
-            if not isinstance(call_id, str) or not isinstance(name, str):
-                continue
-            arguments = _arguments(payload.get("arguments"))
-            calls[call_id] = (index, name, arguments, _timestamp(event))
-            if name == "request_user_input" and index > latest_user_index:
-                questions = arguments.get("questions")
-                if isinstance(questions, list):
-                    for question in questions:
-                        if isinstance(question, dict) and isinstance(question.get("question"), str):
-                            pending_questions.append((index, question["question"]))
-        elif event.get("type") == "response_item" and payload_type in {
-            "function_call_output",
-            "custom_tool_call_output",
-        }:
-            call_id = payload.get("call_id")
-            if isinstance(call_id, str):
-                results[call_id] = (index, payload.get("output"), _timestamp(event))
-
-    operations: list[Operation] = []
-    failures: list[Failure] = []
-    for index, event in enumerate(events):
-        text = _assistant_text(event)
-        if text is not None:
-            operations.append(
-                Operation(
-                    kind="assistant",
-                    event=index,
-                    timestamp=_timestamp(event),
-                    text=text,
-                    status="succeeded",
-                )
-            )
-
-    for call_id, (event_index, name, arguments, timestamp) in calls.items():
-        command, argv = _command_evidence(arguments)
-        if _is_self_invocation(command, argv):
-            continue
-        result = results.get(call_id)
-        result_index: int | None = None
-        output: Any = None
-        result_timestamp: str | None = None
-        if result is not None:
-            result_index, output, result_timestamp = result
-        exit_code, error = _explicit_result(output)
-        shell = exit_code is not None or name in {"exec_command", "write_stdin", "wait"}
-        failed = (exit_code is not None and exit_code != 0) or error is not None
-        status = "pending" if result is None else ("failed" if failed else "succeeded")
-        operations.append(
-            Operation(
-                kind="shell" if shell else "tool",
-                event=event_index,
-                resultEvent=result_index,
-                timestamp=timestamp,
-                tool=name,
-                argv=argv,
-                command=command,
-                exitCode=exit_code,
-                status=status,
-            )
+    if exit_code is not None and exit_code != 0:
+        return operation, Failure(
+            kind="shell",
+            tool=call.name,
+            event=result_index,
+            timestamp=result_timestamp or call.timestamp,
+            argv=call.argv,
+            command=call.command,
+            input=call.input,
+            exitCode=exit_code,
         )
-        if exit_code is not None and exit_code != 0:
-            failures.append(
-                Failure(
-                    kind="shell",
-                    tool=name,
-                    event=result_index if result_index is not None else event_index,
-                    timestamp=result_timestamp or timestamp,
-                    argv=argv,
-                    command=command,
-                    exitCode=exit_code,
-                )
-            )
-        elif error is not None:
-            retained, truncated = _bounded_error(error)
-            failures.append(
-                Failure(
-                    kind="tool",
-                    tool=name,
-                    event=result_index if result_index is not None else event_index,
-                    timestamp=result_timestamp or timestamp,
-                    argv=argv,
-                    command=command,
-                    error=retained,
-                    truncated=truncated,
-                )
-            )
-    operations.sort(key=lambda item: (item.event, item.result_event or -1))
-    failures.sort(key=lambda item: item.event)
-    return operations, failures, pending_questions
+    if error is not None:
+        retained, truncated = _bounded_error(error)
+        return operation, Failure(
+            kind="tool",
+            tool=call.name,
+            event=result_index,
+            timestamp=result_timestamp or call.timestamp,
+            argv=call.argv,
+            command=call.command,
+            input=call.input,
+            error=retained,
+            truncated=truncated,
+        )
+    return operation, None
 
 
 def _arguments(value: Any) -> dict[str, Any]:
@@ -375,6 +490,14 @@ def _arguments(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _custom_input(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def _command_evidence(arguments: dict[str, Any]) -> tuple[str | None, list[str] | None]:
     command = arguments.get("cmd") or arguments.get("command")
     argv = arguments.get("argv")
@@ -387,6 +510,41 @@ def _command_evidence(arguments: dict[str, Any]) -> tuple[str | None, list[str] 
     if exact_command is not None:
         return exact_command, None
     return None, exact_argv
+
+
+def _question_texts(arguments: dict[str, Any]) -> list[str]:
+    questions = arguments.get("questions")
+    if not isinstance(questions, list):
+        return []
+    return [
+        question["question"]
+        for question in questions
+        if isinstance(question, dict)
+        and isinstance(question.get("question"), str)
+        and question["question"].strip()
+    ]
+
+
+def _contains_answer(output: Any) -> bool:
+    structured = output
+    if isinstance(output, str):
+        try:
+            structured = json.loads(output)
+        except json.JSONDecodeError:
+            return False
+    if not isinstance(structured, dict) or "answers" not in structured:
+        return False
+    return _nonempty(structured["answers"])
+
+
+def _nonempty(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(_nonempty(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_nonempty(item) for item in value)
+    return value is not None
 
 
 def _explicit_result(output: Any) -> tuple[int | None, str | None]:
@@ -437,17 +595,70 @@ def _is_self_invocation(command: str | None, argv: list[str] | None) -> bool:
     )
 
 
-def _latest_progress_cues(
-    events: list[dict[str, Any]],
-) -> tuple[int | None, dict[str, list[str]]]:
-    for index in range(len(events) - 1, -1, -1):
-        text = _assistant_text(events[index])
-        if text is None:
-            continue
-        cues = _parse_cues(text)
-        if cues:
-            return index, cues
-    return None, {}
+def _classify_validation(operation: Operation) -> ValidationResult | None:
+    if operation.kind != "shell" or operation.result_event is None or operation.exit_code is None:
+        return None
+    classifier = _validation_classifier(operation.command, operation.argv)
+    if classifier is None:
+        return None
+    status = "passed" if operation.exit_code == 0 else "failed"
+    kind, name = classifier
+    if kind == "test":
+        return TestValidation(
+            kind="test",
+            framework="pytest",
+            operationEvent=operation.event,
+            resultEvent=operation.result_event,
+            status=status,
+            exitCode=operation.exit_code,
+        )
+    return QualificationValidation(
+        kind="qualification",
+        gate=name,
+        operationEvent=operation.event,
+        resultEvent=operation.result_event,
+        status=status,
+        exitCode=operation.exit_code,
+    )
+
+
+def _validation_classifier(
+    command: str | None, argv: list[str] | None
+) -> tuple[str, str] | None:
+    if argv is not None:
+        if _pytest_argv(argv):
+            return "test", "pytest"
+        if argv in (["handoff", "--help"], ["uv", "run", "handoff", "--help"]):
+            return "qualification", "handoff-help"
+        if argv == ["uv", "lock", "--check"]:
+            return "qualification", "uv-lock-check"
+        if argv[:2] == ["uv", "build"]:
+            return "qualification", "uv-build"
+        if argv[:2] == ["uv", "sync"] or argv[:3] == ["uv", "pip", "install"]:
+            return "qualification", "uv-install"
+        return None
+    if command is None:
+        return None
+    normalized = command.strip()
+    if _COMPOUND_SHELL.search(normalized):
+        return None
+    if _PYTEST_COMMAND.fullmatch(normalized):
+        return "test", "pytest"
+    for name, pattern in _QUALIFICATION_COMMANDS:
+        if pattern.fullmatch(normalized):
+            return "qualification", name
+    return None
+
+
+def _pytest_argv(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    value = argv
+    if value[:2] == ["uv", "run"]:
+        value = value[2:]
+    if value and value[0] == "pytest":
+        return True
+    return len(value) >= 3 and re.fullmatch(r"python(?:3(?:\.\d+)*)?", value[0]) is not None and value[1:3] == ["-m", "pytest"]
 
 
 def _parse_cues(text: str) -> dict[str, list[str]]:
@@ -464,7 +675,7 @@ def _parse_cues(text: str) -> dict[str, list[str]]:
             if items:
                 values[active] = items
         else:
-            value = "\n".join(line for line in buffer).strip()
+            value = "\n".join(buffer).strip()
             if value:
                 values[active] = [value]
         buffer = []
@@ -503,14 +714,6 @@ def _derived(value: str, event: int, derivation: str) -> DerivedValue:
     return DerivedValue(value=value, sourceEvents=[event], derivation=derivation)
 
 
-def _latest_user_message(events: list[dict[str, Any]]) -> tuple[int, str] | None:
-    for index in range(len(events) - 1, -1, -1):
-        text = _user_text(events[index])
-        if text:
-            return index, text
-    return None
-
-
 def _user_text(event: dict[str, Any]) -> str | None:
     payload = event.get("payload")
     if event.get("type") != "event_msg" or not isinstance(payload, dict):
@@ -531,6 +734,28 @@ def _assistant_text(event: dict[str, Any]) -> str | None:
     return message if isinstance(message, str) and message.strip() else None
 
 
-def _timestamp(event: dict[str, Any]) -> str | None:
-    value = event.get("timestamp")
-    return value if isinstance(value, str) and value else None
+def _timestamp(event: dict[str, Any], index: int) -> datetime | None:
+    if "timestamp" not in event:
+        return None
+    value = event["timestamp"]
+    if not isinstance(value, str) or _RFC3339.fullmatch(value) is None:
+        raise RolloutError(f"invalid timestamp at event {index}")
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise RolloutError(f"invalid timestamp at event {index}") from error
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise RolloutError(f"invalid timestamp at event {index}")
+    return timestamp
+
+
+def _omission_diagnostic(
+    diagnostics: list[Diagnostic], projection: str, count: int
+) -> None:
+    if count:
+        diagnostics.append(
+            Diagnostic(
+                code=f"rollout.{projection}-omitted",
+                detail=f"Omitted {count} earlier {projection} outside the retained window.",
+            )
+        )

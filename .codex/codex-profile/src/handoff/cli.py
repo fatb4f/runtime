@@ -11,7 +11,7 @@ from typing import Sequence
 from pydantic import ValidationError
 
 from .git import GitError, begin_snapshot, finish_snapshot, resolve_repository
-from .model import DerivedValue, Handoff, canonical_bytes
+from .model import Handoff, canonical_bytes
 from .rollout import RolloutError, project_rollout, resolve_rollout
 
 
@@ -66,14 +66,6 @@ def create_handoff(
     capture = begin_snapshot(root)
     rollout = project_rollout(admitted)
     repository_projection = finish_snapshot(capture)
-    completed = list(rollout.completed)
-    for entry in repository_projection.staged:
-        detail = f"Staged {entry.status} {entry.path}"
-        if entry.source_path is not None:
-            detail = f"Staged R {entry.source_path} -> {entry.path}"
-        completed.append(
-            DerivedValue(value=detail, sourceEvents=[], derivation="git-staged-change")
-        )
 
     packet = Handoff(
         schema="codex.handoff.v0",
@@ -81,11 +73,12 @@ def create_handoff(
         repository=repository_projection,
         session=rollout.session,
         objective=rollout.objective,
-        completed=completed,
+        completed=rollout.completed,
         currentOperation=rollout.current_operation,
         nextOperation=rollout.next_operation,
         completionCriteria=rollout.completion_criteria,
         operations=rollout.operations,
+        validation=rollout.validation,
         failures=rollout.failures,
         openQuestions=rollout.open_questions,
         diagnostics=rollout.diagnostics,
