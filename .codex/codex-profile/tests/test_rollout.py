@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
 
+from handoff.codex_wire import MAX_CUSTOM_INPUT_BYTES
 from handoff.rollout import RolloutError, project_rollout, resolve_rollout
 
 from conftest import write_rollout
@@ -41,14 +43,23 @@ def _call(call_id: str, name: str, arguments: dict) -> dict:
 
 
 def _result(call_id: str, output: object) -> dict:
+    wire_output = (
+        json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if isinstance(output, dict)
+        else output
+    )
     return {
         "timestamp": "2026-07-26T20:04:00Z",
         "type": "response_item",
-        "payload": {"type": "function_call_output", "call_id": call_id, "output": output},
+        "payload": {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": wire_output,
+        },
     }
 
 
-def _custom_call(call_id: str, name: str, input_value: object) -> dict:
+def _custom_call(call_id: str, name: str, input_value: str) -> dict:
     return {
         "timestamp": "2026-07-26T20:03:00Z",
         "type": "response_item",
@@ -62,10 +73,19 @@ def _custom_call(call_id: str, name: str, input_value: object) -> dict:
 
 
 def _custom_result(call_id: str, output: object) -> dict:
+    wire_output = (
+        json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if isinstance(output, dict)
+        else output
+    )
     return {
         "timestamp": "2026-07-26T20:04:00Z",
         "type": "response_item",
-        "payload": {"type": "custom_tool_call_output", "call_id": call_id, "output": output},
+        "payload": {
+            "type": "custom_tool_call_output",
+            "call_id": call_id,
+            "output": wire_output,
+        },
     }
 
 
@@ -228,7 +248,7 @@ def test_custom_tool_failure_is_projected_without_argv(
         repository,
         [
             _user("Work"),
-            _custom_call("custom-1", "exec", {"source": "do_work()"}),
+            _custom_call("custom-1", "exec", '{"source":"do_work()"}'),
             _custom_result("custom-1", {"status": "failed", "error": "boom"}),
         ],
     )
@@ -347,3 +367,153 @@ def test_runtime_validation_commands_are_classified(
     assert len(projection.validation) == 1
     assert projection.validation[0].kind == "test"
     assert projection.validation[0].status == "passed"
+
+
+@pytest.mark.parametrize(
+    "call, result, expected, received",
+    [
+        (
+            _call("cross-family", "tool", {}),
+            _custom_result("cross-family", "done"),
+            "function_call_output",
+            "custom_tool_call_output",
+        ),
+        (
+            _custom_call("cross-family", "tool", "input"),
+            _result("cross-family", "done"),
+            "custom_tool_call_output",
+            "function_call_output",
+        ),
+    ],
+)
+def test_cross_family_output_is_rejected(
+    repository: Path,
+    tmp_path: Path,
+    call: dict,
+    result: dict,
+    expected: str,
+    received: str,
+) -> None:
+    rollout = write_rollout(
+        tmp_path / "rollout.jsonl",
+        repository,
+        [_user("Work"), call, result],
+    )
+    message = (
+        "call result family mismatch at event 3:\n"
+        f"call_id=cross-family expected={expected}\n"
+        f"received={received}"
+    )
+    with pytest.raises(RolloutError, match=re.escape(message)):
+        project_rollout(resolve_rollout(repository, explicit=rollout))
+
+
+def test_ordinary_tool_output_with_exit_phrase_remains_tool(
+    repository: Path, tmp_path: Path
+) -> None:
+    rollout = write_rollout(
+        tmp_path / "rollout.jsonl",
+        repository,
+        [
+            _user("Work"),
+            _call("read", "read_file", {"path": "result.txt"}),
+            _result("read", "Process exited with code 9"),
+        ],
+    )
+    projection = project_rollout(resolve_rollout(repository, explicit=rollout))
+    operation = next(item for item in projection.operations if item.tool == "read_file")
+    assert operation.kind == "tool"
+    assert operation.exit_code is None
+    assert operation.status == "succeeded"
+    assert projection.failures == []
+
+
+def test_custom_call_named_like_shell_remains_tool(
+    repository: Path, tmp_path: Path
+) -> None:
+    rollout = write_rollout(
+        tmp_path / "rollout.jsonl",
+        repository,
+        [
+            _user("Work"),
+            _custom_call("custom-shell", "exec_command", "echo no"),
+            _custom_result("custom-shell", "Process exited with code 12"),
+        ],
+    )
+    projection = project_rollout(resolve_rollout(repository, explicit=rollout))
+    operation = next(item for item in projection.operations if item.tool == "exec_command")
+    assert operation.kind == "tool"
+    assert operation.status == "succeeded"
+
+
+def test_known_shell_parses_structured_exit_code(
+    repository: Path, tmp_path: Path
+) -> None:
+    rollout = write_rollout(
+        tmp_path / "rollout.jsonl",
+        repository,
+        [
+            _user("Work"),
+            _call("shell", "shell_command", {"command": "exit 4"}),
+            _result("shell", {"exit_code": 4, "output": ""}),
+        ],
+    )
+    projection = project_rollout(resolve_rollout(repository, explicit=rollout))
+    operation = next(item for item in projection.operations if item.tool == "shell_command")
+    assert operation.kind == "shell"
+    assert operation.exit_code == 4
+    assert operation.status == "failed"
+
+
+def test_unknown_tool_defaults_to_tool(repository: Path, tmp_path: Path) -> None:
+    rollout = write_rollout(
+        tmp_path / "rollout.jsonl",
+        repository,
+        [
+            _user("Work"),
+            _call("unknown", "container.exec", {"command": "false"}),
+            _result("unknown", {"exit_code": 3}),
+        ],
+    )
+    projection = project_rollout(resolve_rollout(repository, explicit=rollout))
+    operation = next(item for item in projection.operations if item.tool == "container.exec")
+    assert operation.kind == "tool"
+    assert operation.exit_code is None
+    assert operation.status == "succeeded"
+
+
+def test_shell_without_exit_evidence_is_rejected(
+    repository: Path, tmp_path: Path
+) -> None:
+    rollout = write_rollout(
+        tmp_path / "rollout.jsonl",
+        repository,
+        [
+            _user("Work"),
+            _call("shell", "exec_command", {"cmd": "long-running"}),
+            _result("shell", {"session_id": 42, "output": "still running"}),
+        ],
+    )
+    with pytest.raises(RolloutError, match="has no exit status"):
+        project_rollout(resolve_rollout(repository, explicit=rollout))
+
+
+def test_custom_input_truncation_emits_diagnostic(
+    repository: Path, tmp_path: Path
+) -> None:
+    oversized = ("x" * (MAX_CUSTOM_INPUT_BYTES - 1)) + "é"
+    rollout = write_rollout(
+        tmp_path / "rollout.jsonl",
+        repository,
+        [_user("Work"), _custom_call("large", "custom", oversized)],
+    )
+    projection = project_rollout(resolve_rollout(repository, explicit=rollout))
+    operation = next(item for item in projection.operations if item.tool == "custom")
+    assert operation.input == "x" * (MAX_CUSTOM_INPUT_BYTES - 1)
+    diagnostic = next(
+        item
+        for item in projection.diagnostics
+        if item.code == "rollout.custom-input-truncated"
+    )
+    assert diagnostic.event_index == 2
+    assert diagnostic.detail == "originalBytes=32769 retainedBytes=32767"

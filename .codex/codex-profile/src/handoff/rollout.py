@@ -9,6 +9,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
+from .codex_wire import (
+    CallFamily,
+    CustomToolCall,
+    CustomToolCallOutput,
+    FunctionCall,
+    FunctionCallOutput,
+    OutputBody,
+    WireParseError,
+    bound_utf8,
+    parse_response_item,
+)
 from .git import GitError, resolve_metadata_repository
 from .model import (
     Diagnostic,
@@ -24,6 +35,7 @@ from .model import (
     TestValidation,
     ValidationResult,
 )
+from .tool_registry import classify_tool
 
 _PROGRESS_HEADERS = {
     "Objective": "objective",
@@ -34,7 +46,6 @@ _PROGRESS_HEADERS = {
     "Open questions": "open_questions",
 }
 _LIST_FIELDS = {"completed", "completion_criteria", "open_questions"}
-_SHELL_TOOLS = {"exec_command", "write_stdin", "wait"}
 _SHELL_RESULT = re.compile(r"^Process exited with code:?\s*(-?[0-9]+)\s*$", re.MULTILINE)
 _RFC3339 = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
@@ -82,6 +93,7 @@ class RolloutProjection:
 
 @dataclass(frozen=True)
 class _Call:
+    family: CallFamily
     event: int
     name: str
     timestamp: datetime | None
@@ -254,31 +266,48 @@ def project_rollout(admitted: AdmittedRollout) -> RolloutProjection:
                 if parsed and latest_user is not None and index > latest_user[0]:
                     cue_index, cues = index, parsed
 
-            payload = event.get("payload")
-            if event.get("type") != "response_item" or not isinstance(payload, dict):
+            if event.get("type") != "response_item":
                 continue
-            payload_type = payload.get("type")
-            if payload_type in {"function_call", "custom_tool_call"}:
-                call_id = payload.get("call_id")
-                name = payload.get("name")
-                if not isinstance(call_id, str) or not call_id:
-                    raise RolloutError(f"tool call at event {index} has no call_id")
-                if not isinstance(name, str) or not name:
-                    raise RolloutError(f"tool call at event {index} has no name")
+            try:
+                wire_item = parse_response_item(event.get("payload"))
+            except WireParseError as error:
+                raise RolloutError(
+                    f"malformed response item at event {index}: {error}"
+                ) from error
+            if wire_item is None:
+                continue
+            if isinstance(wire_item, (FunctionCall, CustomToolCall)):
+                call_id = wire_item.call_id
+                name = wire_item.name
                 if call_id in seen_calls:
                     raise RolloutError(f"duplicate tool call_id at event {index}: {call_id}")
                 seen_calls.add(call_id)
-                if payload_type == "function_call":
-                    arguments = _arguments(payload.get("arguments"))
+                if isinstance(wire_item, FunctionCall):
+                    family: CallFamily = "function"
+                    arguments = wire_item.arguments
                     command, argv = _command_evidence(arguments)
                     input_value = None
                     if name == "request_user_input":
                         for text in _question_texts(arguments):
                             questions.append(_Question(call_id=call_id, event=index, text=text))
                 else:
+                    family = "custom"
                     command, argv = None, None
-                    input_value = _custom_input(payload.get("input"))
+                    bounded = bound_utf8(wire_item.input)
+                    input_value = bounded.value
+                    if bounded.truncated:
+                        diagnostics.append(
+                            Diagnostic(
+                                code="rollout.custom-input-truncated",
+                                detail=(
+                                    f"originalBytes={bounded.original_bytes} "
+                                    f"retainedBytes={bounded.retained_bytes}"
+                                ),
+                                eventIndex=index,
+                            )
+                        )
                 calls[call_id] = _Call(
+                    family=family,
                     event=index,
                     name=name,
                     timestamp=timestamp,
@@ -286,22 +315,36 @@ def project_rollout(admitted: AdmittedRollout) -> RolloutProjection:
                     argv=argv,
                     input=input_value,
                 )
-            elif payload_type in {"function_call_output", "custom_tool_call_output"}:
-                call_id = payload.get("call_id")
-                if not isinstance(call_id, str) or not call_id:
-                    raise RolloutError(f"tool result at event {index} has no call_id")
+            else:
+                call_id = wire_item.call_id
                 if call_id in seen_results:
                     raise RolloutError(f"duplicate tool result at event {index}: {call_id}")
                 if call_id not in seen_calls or call_id not in calls:
                     raise RolloutError(f"orphan tool result at event {index}: {call_id}")
+                call = calls[call_id]
+                received = (
+                    "function_call_output"
+                    if isinstance(wire_item, FunctionCallOutput)
+                    else "custom_tool_call_output"
+                )
+                expected = {
+                    "function": "function_call_output",
+                    "custom": "custom_tool_call_output",
+                }[call.family]
+                if received != expected:
+                    raise RolloutError(
+                        f"call result family mismatch at event {index}:\n"
+                        f"call_id={call_id} expected={expected}\n"
+                        f"received={received}"
+                    )
                 seen_results.add(call_id)
-                call = calls.pop(call_id)
-                output = payload.get("output")
+                calls.pop(call_id)
+                output = wire_item.output
                 if _contains_answer(output):
                     questions = [
                         question for question in questions if question.call_id != call_id
                     ]
-                operation, failure = _completed_operation(call, index, timestamp, output)
+                operation, failure = _complete_call(call, index, timestamp, output)
                 if not _is_self_invocation(call.command, call.argv):
                     operations.add(
                         operation, event=operation.event, result_event=operation.result_event
@@ -322,9 +365,9 @@ def project_rollout(admitted: AdmittedRollout) -> RolloutProjection:
     for call in calls.values():
         if _is_self_invocation(call.command, call.argv):
             continue
-        shell = call.name in _SHELL_TOOLS
+        kind = classify_tool(call.name, call.family)
         operation = Operation(
-            kind="shell" if shell else "tool",
+            kind=kind,
             event=call.event,
             timestamp=call.timestamp,
             tool=call.name,
@@ -430,17 +473,31 @@ def _validate_metadata(
         raise RolloutError("snapshotted session_meta differs from preliminary admission")
 
 
-def _completed_operation(
+def _complete_call(
     call: _Call,
     result_index: int,
     result_timestamp: datetime | None,
-    output: Any,
+    output: OutputBody,
 ) -> tuple[Operation, Failure | None]:
-    exit_code, error = _explicit_result(output)
-    shell = exit_code is not None
-    failed = (exit_code is not None and exit_code != 0) or error is not None
+    if classify_tool(call.name, call.family) == "shell":
+        return _complete_shell_call(call, result_index, result_timestamp, output)
+    return _complete_tool_call(call, result_index, result_timestamp, output)
+
+
+def _complete_shell_call(
+    call: _Call,
+    result_index: int,
+    result_timestamp: datetime | None,
+    output: OutputBody,
+) -> tuple[Operation, Failure | None]:
+    exit_code = _shell_exit_code(output)
+    if exit_code is None:
+        raise RolloutError(
+            f"shell result at event {result_index} has no exit status: {call.name}"
+        )
+    failed = exit_code != 0
     operation = Operation(
-        kind="shell" if shell else "tool",
+        kind="shell",
         event=call.event,
         resultEvent=result_index,
         timestamp=call.timestamp,
@@ -451,7 +508,7 @@ def _completed_operation(
         exitCode=exit_code,
         status="failed" if failed else "succeeded",
     )
-    if exit_code is not None and exit_code != 0:
+    if failed:
         return operation, Failure(
             kind="shell",
             tool=call.name,
@@ -462,6 +519,27 @@ def _completed_operation(
             input=call.input,
             exitCode=exit_code,
         )
+    return operation, None
+
+
+def _complete_tool_call(
+    call: _Call,
+    result_index: int,
+    result_timestamp: datetime | None,
+    output: OutputBody,
+) -> tuple[Operation, Failure | None]:
+    error = _explicit_tool_error(output)
+    operation = Operation(
+        kind="tool",
+        event=call.event,
+        resultEvent=result_index,
+        timestamp=call.timestamp,
+        tool=call.name,
+        argv=call.argv,
+        command=call.command,
+        input=call.input,
+        status="failed" if error is not None else "succeeded",
+    )
     if error is not None:
         retained, truncated = _bounded_error(error)
         return operation, Failure(
@@ -478,27 +556,7 @@ def _completed_operation(
     return operation, None
 
 
-def _arguments(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            decoded = json.loads(value)
-        except json.JSONDecodeError:
-            return {}
-        return decoded if isinstance(decoded, dict) else {}
-    return {}
-
-
-def _custom_input(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _command_evidence(arguments: dict[str, Any]) -> tuple[str | None, list[str] | None]:
+def _command_evidence(arguments: dict[str, object]) -> tuple[str | None, list[str] | None]:
     command = arguments.get("cmd") or arguments.get("command")
     argv = arguments.get("argv")
     exact_command = command if isinstance(command, str) else None
@@ -512,7 +570,7 @@ def _command_evidence(arguments: dict[str, Any]) -> tuple[str | None, list[str] 
     return None, exact_argv
 
 
-def _question_texts(arguments: dict[str, Any]) -> list[str]:
+def _question_texts(arguments: dict[str, object]) -> list[str]:
     questions = arguments.get("questions")
     if not isinstance(questions, list):
         return []
@@ -547,30 +605,41 @@ def _nonempty(value: Any) -> bool:
     return value is not None
 
 
-def _explicit_result(output: Any) -> tuple[int | None, str | None]:
-    structured = output
-    if isinstance(output, str):
-        try:
-            structured = json.loads(output)
-        except json.JSONDecodeError:
-            match = _SHELL_RESULT.search(output)
-            return (int(match.group(1)), None) if match else (None, None)
+def _shell_exit_code(output: OutputBody) -> int | None:
+    if not isinstance(output, str):
+        return None
+    try:
+        structured = json.loads(output)
+    except json.JSONDecodeError:
+        structured = None
+    if isinstance(structured, dict):
+        exit_code = structured.get("exit_code")
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+            return exit_code
+    match = _SHELL_RESULT.search(output)
+    return int(match.group(1)) if match else None
+
+
+def _explicit_tool_error(output: OutputBody) -> str | None:
+    if not isinstance(output, str):
+        return None
+    try:
+        structured = json.loads(output)
+    except json.JSONDecodeError:
+        return None
     if not isinstance(structured, dict):
-        return None, None
-    exit_code = structured.get("exitCode", structured.get("exit_code"))
-    resolved_exit = exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
+        return None
     explicit_error = structured.get("error")
     failed_status = structured.get("status") == "failed"
-    error: str | None = None
     if explicit_error is not None:
-        error = (
+        return (
             explicit_error
             if isinstance(explicit_error, str)
             else json.dumps(explicit_error, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         )
-    elif failed_status:
-        error = "tool result reported status=failed"
-    return resolved_exit, error
+    if failed_status:
+        return "tool result reported status=failed"
+    return None
 
 
 def _bounded_error(value: str) -> tuple[str, bool]:

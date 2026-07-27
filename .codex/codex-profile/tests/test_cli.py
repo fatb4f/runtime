@@ -10,6 +10,7 @@ import pytest
 
 import handoff.cli as cli_module
 from handoff.cli import create_handoff, main
+from handoff.codex_wire import MAX_CUSTOM_INPUT_BYTES
 from handoff.rollout import RolloutError
 
 from conftest import git, write_rollout
@@ -68,21 +69,71 @@ def test_create_stages_and_atomically_publishes(repository: Path, tmp_path: Path
     assert git(repository, "diff", "--cached", "--name-only") == "tracked.txt"
 
 
-def test_later_rollout_failure_does_not_rollback_staging(
-    repository: Path, tmp_path: Path
+def test_invalid_rollout_fails_before_git_snapshot(
+    repository: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     rollout = write_rollout(tmp_path / "rollout.jsonl", repository, _events())
     with rollout.open("ab") as handle:
         handle.write(b"{bad}\n")
     (repository / "tracked.txt").write_text("changed\n", encoding="utf-8")
+
+    def unexpected_snapshot(root: Path) -> None:
+        pytest.fail(f"begin_snapshot called for invalid rollout: {root}")
+
+    monkeypatch.setattr(cli_module, "begin_snapshot", unexpected_snapshot)
     with pytest.raises(RolloutError):
         create_handoff(
             repository=repository,
             rollout_path=rollout,
             output_root=tmp_path / "state",
         )
-    assert git(repository, "diff", "--cached", "--name-only") == "tracked.txt"
+    assert git(repository, "diff", "--cached", "--name-only") == ""
+    assert git(repository, "diff", "--name-only") == "tracked.txt"
     assert not (tmp_path / "state").exists()
+
+
+def test_oversized_input_is_bounded_before_git_snapshot(
+    repository: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    oversized = ("x" * (MAX_CUSTOM_INPUT_BYTES - 1)) + "é"
+    events = [
+        *_events(),
+        {
+            "timestamp": "2026-07-26T20:03:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "large",
+                "name": "custom",
+                "input": oversized,
+            },
+        },
+    ]
+    rollout = write_rollout(tmp_path / "rollout.jsonl", repository, events)
+    projected: dict[str, object] = {}
+    real_project_rollout = cli_module.project_rollout
+
+    def recording_projection(admitted):
+        projection = real_project_rollout(admitted)
+        projected["value"] = projection
+        return projection
+
+    def inspect_before_snapshot(root: Path) -> None:
+        projection = projected["value"]
+        operation = next(
+            item for item in projection.operations if item.tool == "custom"
+        )
+        assert len(operation.input.encode("utf-8")) == MAX_CUSTOM_INPUT_BYTES - 1
+        raise RuntimeError("snapshot boundary reached")
+
+    monkeypatch.setattr(cli_module, "project_rollout", recording_projection)
+    monkeypatch.setattr(cli_module, "begin_snapshot", inspect_before_snapshot)
+    with pytest.raises(RuntimeError, match="snapshot boundary reached"):
+        create_handoff(
+            repository=repository,
+            rollout_path=rollout,
+            output_root=tmp_path / "state",
+        )
 
 
 def test_output_root_inside_repository_is_rejected(repository: Path, tmp_path: Path) -> None:

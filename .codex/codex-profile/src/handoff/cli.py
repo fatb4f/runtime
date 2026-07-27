@@ -63,8 +63,8 @@ def create_handoff(
     if _is_within(state_root, root):
         raise ValueError("output root must be outside the repository")
 
-    capture = begin_snapshot(root)
     rollout = project_rollout(admitted)
+    capture = begin_snapshot(root)
     repository_projection = finish_snapshot(capture)
 
     packet = Handoff(
