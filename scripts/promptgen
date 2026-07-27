@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+umask 077
+
+readonly PROGRAM="${0##*/}"
+
+die() {
+    printf '%s: %s\n' "${PROGRAM}" "$*" >&2
+    exit 2
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  promptgen \
+    --slice-repo OWNER/REPO \
+    --slice-issue NUMBER \
+    (--handoff-session SESSION_ID | --handoff-file PATH) \
+    [--handoff-root PATH] \
+    [--output PATH]
+
+Coordinates:
+  --slice-repo       GitHub repository in owner/name form.
+  --slice-issue      Open GitHub issue containing runtime.slice.v0 JSON.
+  --handoff-session  Session directory under the handoff state root.
+  --handoff-file     Exact codex.handoff.v0 file, bypassing session resolution.
+
+Defaults:
+  --handoff-root     $XDG_STATE_HOME/handoff or ~/.local/state/handoff
+  --output           ./prompt.json
+EOF
+}
+
+slice_repo=""
+slice_issue=""
+handoff_session=""
+handoff_file=""
+handoff_root="${XDG_STATE_HOME:-${HOME}/.local/state}/handoff"
+output="prompt.json"
+
+while (($# > 0)); do
+    case "$1" in
+        --slice-repo)
+            (($# >= 2)) || die "--slice-repo requires a value"
+            slice_repo="$2"
+            shift 2
+            ;;
+        --slice-issue)
+            (($# >= 2)) || die "--slice-issue requires a value"
+            slice_issue="$2"
+            shift 2
+            ;;
+        --handoff-session)
+            (($# >= 2)) || die "--handoff-session requires a value"
+            handoff_session="$2"
+            shift 2
+            ;;
+        --handoff-file)
+            (($# >= 2)) || die "--handoff-file requires a value"
+            handoff_file="$2"
+            shift 2
+            ;;
+        --handoff-root)
+            (($# >= 2)) || die "--handoff-root requires a value"
+            handoff_root="$2"
+            shift 2
+            ;;
+        --output)
+            (($# >= 2)) || die "--output requires a value"
+            output="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+command -v gh >/dev/null 2>&1 || die "gh is required"
+command -v jq >/dev/null 2>&1 || die "jq is required"
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
+
+[[ "${slice_repo}" =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]] ||
+    die "invalid --slice-repo: expected OWNER/REPO"
+
+[[ "${slice_issue}" =~ ^[1-9][0-9]*$ ]] ||
+    die "invalid --slice-issue: expected a positive integer"
+
+if [[ -n "${handoff_session}" && -n "${handoff_file}" ]]; then
+    die "--handoff-session and --handoff-file are mutually exclusive"
+fi
+
+if [[ -z "${handoff_session}" && -z "${handoff_file}" ]]; then
+    die "one of --handoff-session or --handoff-file is required"
+fi
+
+if [[ -n "${handoff_session}" ]]; then
+    [[ "${handoff_session}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$ ]] ||
+        die "invalid --handoff-session"
+
+    handoff_file="${handoff_root%/}/${handoff_session}/handoff.json"
+fi
+
+[[ -f "${handoff_file}" ]] ||
+    die "handoff does not exist: ${handoff_file}"
+
+output_directory="$(dirname -- "${output}")"
+mkdir -p -- "${output_directory}"
+
+workspace="$(mktemp -d)"
+output_temporary="$(mktemp "${output_directory}/.prompt.XXXXXX")"
+
+cleanup() {
+    rm -rf -- "${workspace}"
+    rm -f -- "${output_temporary}"
+}
+trap cleanup EXIT
+
+issue_snapshot="${workspace}/issue.json"
+slice_manifest="${workspace}/slice.json"
+
+# Acquire one immutable GitHub issue snapshot.
+gh issue view "${slice_issue}" \
+    --repo "${slice_repo}" \
+    --json number,title,body,state,url,updatedAt \
+    >"${issue_snapshot}" ||
+    die "failed to acquire slice issue ${slice_repo}#${slice_issue}"
+
+# Validate the GitHub response envelope.
+jq -e \
+    --argjson expected_issue "${slice_issue}" '
+    type == "object"
+    and .number == $expected_issue
+    and .state == "OPEN"
+    and (.title | type == "string")
+    and (.body | type == "string")
+    and (.url | type == "string")
+    and (.updatedAt | type == "string")
+' "${issue_snapshot}" >/dev/null ||
+    die "slice issue response is malformed or the issue is not open"
+
+# Preserve the decoded issue body without adding a newline.
+jq -j '.body' "${issue_snapshot}" >"${slice_manifest}"
+
+# Prototype validation of the slice manifest.
+jq -e \
+    --arg repository "${slice_repo}" '
+    type == "object"
+    and .schema == "runtime.slice.v0"
+    and (.sliceID | type == "string" and length > 0)
+    and (.parent | type == "object")
+    and .parent.repository == $repository
+    and (.parent.issue | type == "number" and . >= 1)
+    and (.objective | type == "string" and length > 0)
+    and (.inputs | type == "array")
+    and (.allowedMutationPaths | type == "array")
+    and (.forbiddenMutationPaths | type == "array")
+    and (.focusedValidation | type == "array")
+    and (.closureValidation | type == "array")
+    and (.completionCriteria | type == "array")
+    and (.nonGoals | type == "array")
+' "${slice_manifest}" >/dev/null ||
+    die "issue body is not a valid runtime.slice.v0 prototype manifest"
+
+# Validate the handoff discriminator and required session identity.
+jq -e '
+    type == "object"
+    and .schema == "codex.handoff.v0"
+    and (.session | type == "object")
+    and (.session.sessionId | type == "string" and length > 0)
+' "${handoff_file}" >/dev/null ||
+    die "handoff is not a valid codex.handoff.v0 document"
+
+handoff_sha256="$(
+    sha256sum -- "${handoff_file}" |
+        awk '{print $1}'
+)"
+
+slice_sha256="$(
+    sha256sum -- "${slice_manifest}" |
+        awk '{print $1}'
+)"
+
+# Compose one deterministic prompt document.
+jq -S -c -n \
+    --slurpfile handoff "${handoff_file}" \
+    --slurpfile slice "${slice_manifest}" \
+    --slurpfile issue "${issue_snapshot}" \
+    --arg handoff_path "${handoff_file}" \
+    --arg handoff_sha256 "${handoff_sha256}" \
+    --arg slice_repository "${slice_repo}" \
+    --arg slice_sha256 "${slice_sha256}" '
+    ($handoff[0]) as $handoff_document
+    | ($slice[0]) as $slice_document
+    | ($issue[0]) as $issue_document
+    | {
+        schema: "runtime.prompt.v0",
+        sources: {
+            handoff: {
+                sessionID: $handoff_document.session.sessionId,
+                path: $handoff_path,
+                sha256: $handoff_sha256
+            },
+            slice: {
+                repository: $slice_repository,
+                issue: $issue_document.number,
+                url: $issue_document.url,
+                updatedAt: $issue_document.updatedAt,
+                bodySha256: $slice_sha256
+            }
+        },
+        handoff: $handoff_document,
+        slice: $slice_document,
+        control: {
+            executeOnlyDeclaredSlice: true,
+            respectMutationBoundaries: true,
+            runDeclaredValidation: true,
+            treatHandoffAsPriorSessionEvidence: true,
+            doNotMutateGitHubIssues: true,
+            produceHandoffBeforeContinuing: true
+        }
+    }
+' >"${output_temporary}" ||
+    die "failed to compose prompt document"
+
+chmod 0600 "${output_temporary}"
+mv -f -- "${output_temporary}" "${output}"
+chmod 0600 "${output}"
+
+trap - EXIT
+rm -rf -- "${workspace}"
+
+printf '%s\n' "${output}"
