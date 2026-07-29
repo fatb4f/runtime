@@ -1,0 +1,45 @@
+    {
+      "schema": "runtime.slice.v0",
+      "sliceID": "bootstrap-04-prune-copied-internals",
+      "parent": {
+        "repository": "fatb4f/runtime",
+        "issue": 2
+      },
+      "predecessor": {
+        "sliceID": "bootstrap-03-handoff-retention",
+        "issue": 5
+      },
+      "next": {
+        "sliceID": "bootstrap-05-workspace-closure",
+        "issue": 7
+      },
+      "objective": "Delete copied dotfiles implementation that has no immediate role in the minimal runtime workspace.",
+      "inputs": [
+        "The completed handoff from bootstrap-03-handoff-retention."
+      ],
+      "allowedMutationPaths": [
+        ".codex/",
+        "codex-profile/",
+        "context-workbook/",
+        "context-model/"
+      ],
+      "forbiddenMutationPaths": [],
+      "focusedValidation": [
+        {
+          "kind": "argv",
+          "argv": [
+            "just",
+            "quality"
+          ]
+        }
+      ],
+      "closureValidation": [],
+      "completionCriteria": [
+        "Every retained file has an immediate workspace, quality, test, or handoff purpose.",
+        "No duplicate implementation tree remains.",
+        "No retained file imports a deleted subsystem."
+      ],
+      "nonGoals": [
+        "Introducing repository-intelligence runtime architecture."
+      ]
+    }
