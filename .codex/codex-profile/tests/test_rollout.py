@@ -9,6 +9,7 @@ import pytest
 
 from handoff.codex_wire import MAX_CUSTOM_INPUT_BYTES
 from handoff.rollout import RolloutError, project_rollout, resolve_rollout
+from handoff.tool_registry import classify_tool
 
 from conftest import write_rollout
 
@@ -482,7 +483,7 @@ def test_unknown_tool_defaults_to_tool(repository: Path, tmp_path: Path) -> None
     assert operation.status == "succeeded"
 
 
-def test_shell_without_exit_evidence_is_rejected(
+def test_yielded_exec_command_is_running(
     repository: Path, tmp_path: Path
 ) -> None:
     rollout = write_rollout(
@@ -494,7 +495,178 @@ def test_shell_without_exit_evidence_is_rejected(
             _result("shell", {"session_id": 42, "output": "still running"}),
         ],
     )
-    with pytest.raises(RolloutError, match="has no exit status"):
+    projection = project_rollout(resolve_rollout(repository, explicit=rollout))
+    operation = next(item for item in projection.operations if item.tool == "exec_command")
+    assert operation.kind == "shell"
+    assert operation.status == "running"
+    assert operation.session_id == 42
+    assert operation.exit_code is None
+    assert projection.failures == []
+    assert projection.validation == []
+
+
+@pytest.mark.parametrize(
+    "output, status, exit_code, session_id, failure_count",
+    [
+        ({"session_id": 42, "output": "still running"}, "running", None, 42, 0),
+        ({"exit_code": 0, "output": "done"}, "succeeded", 0, None, 0),
+        ({"exit_code": 7, "output": "failed"}, "failed", 7, None, 1),
+    ],
+)
+def test_write_stdin_projects_unified_shell_results(
+    repository: Path,
+    tmp_path: Path,
+    output: dict[str, object],
+    status: str,
+    exit_code: int | None,
+    session_id: int | None,
+    failure_count: int,
+) -> None:
+    rollout = write_rollout(
+        tmp_path / "rollout.jsonl",
+        repository,
+        [
+            _user("Work"),
+            _call("shell", "write_stdin", {"session_id": 42, "chars": ""}),
+            _result("shell", output),
+        ],
+    )
+    projection = project_rollout(resolve_rollout(repository, explicit=rollout))
+    operation = next(item for item in projection.operations if item.tool == "write_stdin")
+    assert operation.kind == "shell"
+    assert operation.status == status
+    assert operation.exit_code == exit_code
+    assert operation.session_id == session_id
+    assert len(projection.failures) == failure_count
+
+
+@pytest.mark.parametrize(
+    "tool, arguments, output",
+    [
+        (
+            "exec_command",
+            {"cmd": "command"},
+            "exec_command failed for `command`: CreateProcess { message: \"Rejected\" }",
+        ),
+        (
+            "write_stdin",
+            {"session_id": 42, "chars": ""},
+            "write_stdin failed: unknown process id 42",
+        ),
+        (
+            "exec_command",
+            {"cmd": "printf marker"},
+            (
+                "exec_command failed for `printf marker`: "
+                "error included Process exited with code 0"
+            ),
+        ),
+    ],
+)
+def test_stable_shell_terminal_errors_are_failed_without_exit_code(
+    repository: Path,
+    tmp_path: Path,
+    tool: str,
+    arguments: dict[str, object],
+    output: str,
+) -> None:
+    rollout = write_rollout(
+        tmp_path / "rollout.jsonl",
+        repository,
+        [
+            _user("Work"),
+            _call("shell", tool, arguments),
+            _result("shell", output),
+        ],
+    )
+    projection = project_rollout(resolve_rollout(repository, explicit=rollout))
+    operation = next(item for item in projection.operations if item.tool == tool)
+    assert operation.kind == "shell"
+    assert operation.status == "failed"
+    assert operation.exit_code is None
+    assert operation.session_id is None
+    assert len(projection.failures) == 1
+    assert projection.failures[0].error == output
+    assert projection.failures[0].exit_code is None
+    assert projection.validation == []
+
+
+def test_arbitrary_non_json_shell_error_is_rejected(
+    repository: Path, tmp_path: Path
+) -> None:
+    rollout = write_rollout(
+        tmp_path / "rollout.jsonl",
+        repository,
+        [
+            _user("Work"),
+            _call("shell", "exec_command", {"cmd": "command"}),
+            _result("shell", "future shell wrapper: launch failed"),
+        ],
+    )
+    with pytest.raises(RolloutError, match="no terminal marker"):
+        project_rollout(resolve_rollout(repository, explicit=rollout))
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("exec_command", "shell"),
+        ("write_stdin", "shell"),
+        ("shell_command", "shell"),
+        ("shell", "tool"),
+        ("container.exec", "tool"),
+    ],
+)
+def test_function_tool_registry_is_exact(name: str, expected: str) -> None:
+    assert classify_tool(name, "function") == expected
+
+
+@pytest.mark.parametrize("name", ["exec_command", "write_stdin", "shell_command"])
+def test_custom_call_family_never_classifies_as_shell(name: str) -> None:
+    assert classify_tool(name, "custom") == "tool"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        {"exit_code": 0, "session_id": 42, "output": "done"},
+        {"output": "Process exited with code 0"},
+        {"session_id": True, "output": "Process exited with code 0"},
+        {"session_id": 4.2, "output": "running"},
+        {"exit_code": "0", "output": "done"},
+        {"exit_code": None, "output": "done"},
+    ],
+)
+def test_malformed_structured_shell_results_do_not_fall_back_to_legacy_marker(
+    repository: Path, tmp_path: Path, output: dict[str, object]
+) -> None:
+    rollout = write_rollout(
+        tmp_path / "rollout.jsonl",
+        repository,
+        [
+            _user("Work"),
+            _call("shell", "exec_command", {"cmd": "command"}),
+            _result("shell", output),
+        ],
+    )
+    with pytest.raises(RolloutError, match="malformed shell result"):
+        project_rollout(resolve_rollout(repository, explicit=rollout))
+
+
+@pytest.mark.parametrize("output", ["null", "[]", '"Process exited with code 0"'])
+def test_non_object_json_shell_results_are_rejected(
+    repository: Path, tmp_path: Path, output: str
+) -> None:
+    rollout = write_rollout(
+        tmp_path / "rollout.jsonl",
+        repository,
+        [
+            _user("Work"),
+            _call("shell", "exec_command", {"cmd": "command"}),
+            _result("shell", output),
+        ],
+    )
+    with pytest.raises(RolloutError, match="structured output is not an object"):
         project_rollout(resolve_rollout(repository, explicit=rollout))
 
 

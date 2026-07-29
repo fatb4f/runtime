@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeAlias, TypeVar
 
 from .codex_wire import (
     CallFamily,
@@ -47,6 +47,8 @@ _PROGRESS_HEADERS = {
 }
 _LIST_FIELDS = {"completed", "completion_criteria", "open_questions"}
 _SHELL_RESULT = re.compile(r"^Process exited with code:?\s*(-?[0-9]+)\s*$", re.MULTILINE)
+_STABLE_EXEC_ERROR = re.compile(r"\Aexec_command failed for `.+`: .+\Z", re.DOTALL)
+_STABLE_WRITE_STDIN_ERROR = re.compile(r"\Awrite_stdin failed: .+\Z", re.DOTALL)
 _RFC3339 = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
@@ -100,6 +102,26 @@ class _Call:
     command: str | None
     argv: list[str] | None
     input: str | None
+
+
+@dataclass(frozen=True)
+class _TerminalShellResult:
+    exit_code: int
+
+
+@dataclass(frozen=True)
+class _YieldedShellResult:
+    session_id: int
+
+
+@dataclass(frozen=True)
+class _FailedShellResult:
+    error: str
+
+
+_ShellResult: TypeAlias = (
+    _TerminalShellResult | _YieldedShellResult | _FailedShellResult
+)
 
 
 @dataclass
@@ -490,11 +512,50 @@ def _complete_shell_call(
     result_timestamp: datetime | None,
     output: OutputBody,
 ) -> tuple[Operation, Failure | None]:
-    exit_code = _shell_exit_code(output)
-    if exit_code is None:
+    try:
+        result = _shell_result(output, call.name)
+    except ValueError as error:
         raise RolloutError(
-            f"shell result at event {result_index} has no exit status: {call.name}"
+            f"malformed shell result at event {result_index}: {call.name}: {error}"
+        ) from error
+    if isinstance(result, _YieldedShellResult):
+        return Operation(
+            kind="shell",
+            event=call.event,
+            resultEvent=result_index,
+            timestamp=call.timestamp,
+            tool=call.name,
+            argv=call.argv,
+            command=call.command,
+            input=call.input,
+            sessionId=result.session_id,
+            status="running",
+        ), None
+    if isinstance(result, _FailedShellResult):
+        retained, truncated = _bounded_error(result.error)
+        return Operation(
+            kind="shell",
+            event=call.event,
+            resultEvent=result_index,
+            timestamp=call.timestamp,
+            tool=call.name,
+            argv=call.argv,
+            command=call.command,
+            input=call.input,
+            status="failed",
+        ), Failure(
+            kind="shell",
+            tool=call.name,
+            event=result_index,
+            timestamp=result_timestamp or call.timestamp,
+            argv=call.argv,
+            command=call.command,
+            input=call.input,
+            error=retained,
+            truncated=truncated,
         )
+
+    exit_code = result.exit_code
     failed = exit_code != 0
     operation = Operation(
         kind="shell",
@@ -605,19 +666,36 @@ def _nonempty(value: Any) -> bool:
     return value is not None
 
 
-def _shell_exit_code(output: OutputBody) -> int | None:
+def _shell_result(output: OutputBody, tool: str) -> _ShellResult:
     if not isinstance(output, str):
-        return None
+        raise ValueError("output is not a string")
     try:
         structured = json.loads(output)
     except json.JSONDecodeError:
-        structured = None
-    if isinstance(structured, dict):
-        exit_code = structured.get("exit_code")
-        if isinstance(exit_code, int) and not isinstance(exit_code, bool):
-            return exit_code
-    match = _SHELL_RESULT.search(output)
-    return int(match.group(1)) if match else None
+        if tool == "exec_command" and _STABLE_EXEC_ERROR.fullmatch(output):
+            return _FailedShellResult(error=output)
+        if tool == "write_stdin" and _STABLE_WRITE_STDIN_ERROR.fullmatch(output):
+            return _FailedShellResult(error=output)
+        match = _SHELL_RESULT.search(output)
+        if match is None:
+            raise ValueError("non-JSON output has no terminal marker")
+        return _TerminalShellResult(exit_code=int(match.group(1)))
+
+    if not isinstance(structured, dict):
+        raise ValueError("structured output is not an object")
+    has_exit_code = "exit_code" in structured
+    has_session_id = "session_id" in structured
+    if has_exit_code and has_session_id:
+        raise ValueError("structured output has both exit_code and session_id")
+    if not has_exit_code and not has_session_id:
+        raise ValueError("structured output has neither exit_code nor session_id")
+    field = "exit_code" if has_exit_code else "session_id"
+    evidence = structured[field]
+    if not isinstance(evidence, int) or isinstance(evidence, bool):
+        raise ValueError(f"structured output {field} is not a strict integer")
+    if field == "exit_code":
+        return _TerminalShellResult(exit_code=evidence)
+    return _YieldedShellResult(session_id=evidence)
 
 
 def _explicit_tool_error(output: OutputBody) -> str | None:

@@ -134,8 +134,9 @@ class Operation(ClosedModel):
     argv: Annotated[list[Argument], Field(max_length=MAX_ARGV)] | None = None
     command: Text | None = None
     input: Text | None = None
+    session_id: StrictInt | None = Field(default=None, alias="sessionId")
     exit_code: StrictInt | None = Field(default=None, alias="exitCode")
-    status: Literal["pending", "succeeded", "failed"]
+    status: Literal["pending", "running", "succeeded", "failed"]
 
     @model_validator(mode="after")
     def operation_shape(self) -> "Operation":
@@ -148,6 +149,7 @@ class Operation(ClosedModel):
                 or self.argv is not None
                 or self.command is not None
                 or self.input is not None
+                or self.session_id is not None
                 or self.exit_code is not None
                 or self.result_event is not None
                 or self.status != "succeeded"
@@ -157,17 +159,39 @@ class Operation(ClosedModel):
         if self.tool is None or self.text is not None:
             raise ValueError("tool and shell operations require a tool name and no text")
         if self.status == "pending":
-            if self.result_event is not None or self.exit_code is not None:
+            if (
+                self.result_event is not None
+                or self.session_id is not None
+                or self.exit_code is not None
+            ):
                 raise ValueError("pending operations cannot have result evidence")
-        elif self.result_event is None:
+            return self
+        if self.status == "running":
+            if self.kind != "shell":
+                raise ValueError("only shell operations may be running")
+            if (
+                self.result_event is None
+                or self.session_id is None
+                or self.exit_code is not None
+            ):
+                raise ValueError(
+                    "running shell operations require resultEvent and sessionId only"
+                )
+            return self
+        if self.result_event is None:
             raise ValueError("completed operations require resultEvent")
-        if self.kind == "shell" and self.status != "pending":
-            if self.exit_code is None:
-                raise ValueError("completed shell operations require exitCode")
-            if self.status == "succeeded" and self.exit_code != 0:
-                raise ValueError("succeeded shell operations require exitCode zero")
-            if self.status == "failed" and self.exit_code == 0:
-                raise ValueError("failed shell operations require nonzero exitCode")
+        if self.kind == "shell":
+            if self.session_id is not None:
+                raise ValueError("completed shell operations cannot have sessionId")
+            if self.status == "succeeded":
+                if self.exit_code != 0:
+                    raise ValueError("succeeded shell operations require exitCode zero")
+            elif self.exit_code == 0:
+                raise ValueError(
+                    "failed shell operations require nonzero exitCode or terminal error"
+                )
+        elif self.session_id is not None or self.exit_code is not None:
+            raise ValueError("ordinary tool operations cannot have shell result evidence")
         return self
 
 
@@ -188,8 +212,12 @@ class Failure(ClosedModel):
         if sum(value is not None for value in (self.argv, self.command, self.input)) > 1:
             raise ValueError("failure evidence must use only one of argv, command, or input")
         if self.kind == "shell":
-            if self.exit_code is None or self.exit_code == 0 or self.error is not None:
-                raise ValueError("shell failures require a nonzero exitCode")
+            has_exit_failure = self.exit_code is not None and self.exit_code != 0
+            has_terminal_error = self.exit_code is None and bool(self.error)
+            if has_exit_failure == has_terminal_error:
+                raise ValueError(
+                    "shell failures require a nonzero exitCode or terminal error"
+                )
         elif self.error is None:
             raise ValueError("tool failures require explicit error text")
         if self.error is not None and len(self.error.encode("utf-8")) > MAX_ERROR_BYTES:

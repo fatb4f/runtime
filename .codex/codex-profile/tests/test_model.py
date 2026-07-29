@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from datetime import datetime, timezone
 
 import pytest
 from pydantic import ValidationError
 
-from handoff.model import Handoff, Operation, canonical_bytes
+from handoff.model import Failure, Handoff, Operation, canonical_bytes
 
 
 def _handoff_value() -> dict:
@@ -134,6 +135,109 @@ def test_pending_operation_cannot_have_result() -> None:
         )
 
 
+def test_running_shell_operation_requires_session_evidence() -> None:
+    operation = Operation(
+        kind="shell",
+        event=1,
+        resultEvent=2,
+        tool="exec_command",
+        command="long-running",
+        sessionId=42,
+        status="running",
+    )
+    assert operation.session_id == 42
+    assert operation.exit_code is None
+
+
+def test_terminal_shell_error_is_failed_without_fabricated_exit_code() -> None:
+    operation = Operation(
+        kind="shell",
+        event=1,
+        resultEvent=2,
+        tool="exec_command",
+        command="command",
+        status="failed",
+    )
+    failure = Failure(
+        kind="shell",
+        tool="exec_command",
+        event=2,
+        command="command",
+        error="exec_command failed for `command`: launch failed",
+    )
+    assert operation.exit_code is None
+    assert failure.exit_code is None
+    assert failure.error == "exec_command failed for `command`: launch failed"
+
+
+@pytest.mark.parametrize(
+    "values, message",
+    [
+        (
+            {
+                "kind": "tool",
+                "event": 1,
+                "resultEvent": 2,
+                "tool": "read_file",
+                "sessionId": 42,
+                "status": "running",
+            },
+            "only shell",
+        ),
+        (
+            {
+                "kind": "shell",
+                "event": 1,
+                "resultEvent": 2,
+                "tool": "exec_command",
+                "status": "running",
+            },
+            "sessionId",
+        ),
+        (
+            {
+                "kind": "shell",
+                "event": 1,
+                "resultEvent": 2,
+                "tool": "exec_command",
+                "sessionId": 42,
+                "exitCode": 0,
+                "status": "running",
+            },
+            "sessionId only",
+        ),
+        (
+            {
+                "kind": "shell",
+                "event": 1,
+                "resultEvent": 2,
+                "tool": "exec_command",
+                "sessionId": 42,
+                "exitCode": 0,
+                "status": "succeeded",
+            },
+            "cannot have sessionId",
+        ),
+        (
+            {
+                "kind": "tool",
+                "event": 1,
+                "resultEvent": 2,
+                "tool": "read_file",
+                "exitCode": 0,
+                "status": "succeeded",
+            },
+            "shell result evidence",
+        ),
+    ],
+)
+def test_operation_state_evidence_is_enforced(
+    values: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        Operation.model_validate(values)
+
+
 @pytest.mark.parametrize(
     "status, exit_code, message",
     [
@@ -163,6 +267,34 @@ def test_canonical_serialization_is_deterministic() -> None:
     second = Handoff.model_validate(deepcopy(value))
     assert canonical_bytes(first) == canonical_bytes(second)
     assert b'"createdAt":"2026-07-26T23:00:00Z"' in canonical_bytes(first)
+
+
+def test_canonical_serialization_includes_nullable_operation_session_id() -> None:
+    value = _handoff_value()
+    value["createdAt"] = datetime(2026, 7, 26, 23, 0, tzinfo=timezone.utc)
+    value["session"]["lastEvent"] = 4
+    value["operations"] = [
+        {
+            "kind": "shell",
+            "event": 1,
+            "resultEvent": 2,
+            "tool": "exec_command",
+            "sessionId": 42,
+            "status": "running",
+        },
+        {
+            "kind": "tool",
+            "event": 3,
+            "resultEvent": 4,
+            "tool": "read_file",
+            "status": "succeeded",
+        },
+    ]
+    document = json.loads(canonical_bytes(Handoff.model_validate(value)))
+    assert document["operations"][0]["sessionId"] == 42
+    assert document["operations"][0]["exitCode"] is None
+    assert document["operations"][1]["sessionId"] is None
+    assert document["operations"][1]["exitCode"] is None
 
 
 def test_validation_must_reference_matching_operation() -> None:

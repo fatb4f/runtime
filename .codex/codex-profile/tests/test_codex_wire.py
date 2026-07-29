@@ -67,6 +67,97 @@ def test_output_variants_parse_upstream_bodies() -> None:
 
 
 @pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "input_text", "text": ""},
+        {"type": "input_image", "image_url": "data:image/png;base64,x"},
+        {
+            "type": "input_image",
+            "image_url": "https://example.invalid/image.png",
+            "detail": "original",
+        },
+        {
+            "type": "input_image",
+            "image_url": "https://example.invalid/image.png",
+            "detail": None,
+        },
+        {"type": "input_audio", "audio_url": "data:audio/wav;base64,x"},
+        {"type": "encrypted_content", "encrypted_content": "ciphertext"},
+    ],
+)
+def test_structured_output_accepts_pinned_content_variants(
+    item: dict[str, object],
+) -> None:
+    payload = {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": [item],
+    }
+    parsed = parse_response_item(payload)
+    assert parsed == FunctionCallOutput(call_id="call-1", output=[item])
+    assert isinstance(parsed, FunctionCallOutput)
+    assert parsed.output[0] is not item
+
+
+def test_structured_output_accepts_empty_and_mixed_arrays() -> None:
+    output = [
+        {"type": "input_text", "text": "text", "future": {"accepted": True}},
+        {"type": "input_audio", "audio_url": "data:audio/wav;base64,x"},
+        {"type": "encrypted_content", "encrypted_content": "ciphertext"},
+    ]
+    assert parse_response_item(
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call-1",
+            "output": [],
+        }
+    ) == CustomToolCallOutput(call_id="call-1", output=[])
+    assert parse_response_item(
+        {
+            "type": "custom_tool_call_output",
+            "call_id": "call-2",
+            "output": output,
+        }
+    ) == CustomToolCallOutput(call_id="call-2", output=output)
+
+
+@pytest.mark.parametrize(
+    "item, message",
+    [
+        ({}, "unsupported content type"),
+        ("text", "not an object"),
+        ({"type": "unknown", "text": "x"}, "unsupported content type"),
+        ({"type": "input_text"}, "text is not a string"),
+        ({"type": "input_image", "image_url": 12}, "image_url is not a string"),
+        (
+            {
+                "type": "input_image",
+                "image_url": "https://example.invalid/image.png",
+                "detail": "full",
+            },
+            "detail is invalid",
+        ),
+        ({"type": "input_audio"}, "audio_url is not a string"),
+        (
+            {"type": "encrypted_content", "encrypted_content": None},
+            "encrypted_content is not a string",
+        ),
+    ],
+)
+def test_structured_output_rejects_malformed_content_items(
+    item: object, message: str
+) -> None:
+    with pytest.raises(WireParseError, match=message):
+        parse_response_item(
+            {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": [item],
+            }
+        )
+
+
+@pytest.mark.parametrize(
     "payload, message",
     [
         (

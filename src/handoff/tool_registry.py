@@ -6,7 +6,13 @@ from .codex_wire import CallFamily
 
 ToolKind = Literal["shell", "tool"]
 
-_SHELL_TOOLS = frozenset({"exec_command", "shell", "shell_command"})
+_SHELL_TOOLS = frozenset(
+    {
+        "exec_command",
+        "write_stdin",
+        "shell_command",
+    }
+)
 
 
 def classify_tool(name: str, family: CallFamily) -> ToolKind:

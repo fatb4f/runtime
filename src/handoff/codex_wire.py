@@ -148,6 +148,40 @@ def _output(payload: dict[object, object], item_type: str) -> OutputBody:
     value = payload["output"]
     if isinstance(value, str):
         return value
-    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
-        return value
+    if isinstance(value, list):
+        return [_content_item(item, index) for index, item in enumerate(value)]
     raise WireParseError(f"{item_type}.output is not a string or structured item array")
+
+
+def _content_item(value: object, index: int) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise WireParseError(f"output[{index}] is not an object")
+    item_type = value.get("type")
+    if item_type == "input_text":
+        _required_content_string(value, "text", index)
+    elif item_type == "input_image":
+        _required_content_string(value, "image_url", index)
+        _optional_image_detail(value, index)
+    elif item_type == "input_audio":
+        _required_content_string(value, "audio_url", index)
+    elif item_type == "encrypted_content":
+        _required_content_string(value, "encrypted_content", index)
+    else:
+        raise WireParseError(
+            f"output[{index}] has unsupported content type: {item_type!r}"
+        )
+    return dict(value)
+
+
+def _required_content_string(
+    value: dict[object, object], field: str, index: int
+) -> None:
+    if not isinstance(value.get(field), str):
+        raise WireParseError(f"output[{index}].{field} is not a string")
+
+
+def _optional_image_detail(value: dict[object, object], index: int) -> None:
+    if "detail" not in value or value["detail"] is None:
+        return
+    if value["detail"] not in {"auto", "low", "high", "original"}:
+        raise WireParseError(f"output[{index}].detail is invalid")

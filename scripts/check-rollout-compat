@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+from pathlib import Path
+
+from handoff.git import resolve_metadata_repository
+from handoff.rollout import project_rollout, resolve_rollout
+
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_DEFAULT_SOURCE_LOCK = (
+    Path(__file__).resolve().parents[1]
+    / ".codex"
+    / "codex-profile"
+    / "codex-source-lock.json"
+)
+
+
+def _digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _metadata_repository(path: Path) -> Path:
+    working_directories: set[str] = set()
+    with path.open("rb") as handle:
+        for raw in handle:
+            if not raw.endswith(b"\n"):
+                break
+            try:
+                event = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(event, dict) or event.get("type") != "session_meta":
+                continue
+            payload = event.get("payload")
+            if isinstance(payload, dict) and isinstance(payload.get("cwd"), str):
+                working_directories.add(payload["cwd"])
+    if len(working_directories) != 1:
+        raise ValueError("session_meta does not identify one working directory")
+    return resolve_metadata_repository(Path(next(iter(working_directories))))
+
+
+def _entry(value: object, index: int) -> tuple[Path, str, str]:
+    if not isinstance(value, dict):
+        raise ValueError(f"rollouts[{index}] is not an object")
+    if set(value) != {"path", "sha256", "sessionId", "expected"}:
+        raise ValueError(f"rollouts[{index}] has an invalid shape")
+    path = value["path"]
+    sha256 = value["sha256"]
+    session_id = value["sessionId"]
+    if not isinstance(path, str) or not path:
+        raise ValueError(f"rollouts[{index}].path is not a nonempty string")
+    if not isinstance(sha256, str) or _SHA256.fullmatch(sha256) is None:
+        raise ValueError(f"rollouts[{index}].sha256 is not lowercase SHA-256")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError(f"rollouts[{index}].sessionId is not a nonempty string")
+    if value["expected"] != "success":
+        raise ValueError(f"rollouts[{index}].expected is not 'success'")
+    resolved = Path(path).expanduser()
+    if not resolved.is_absolute():
+        raise ValueError(f"rollouts[{index}].path is not absolute")
+    return resolved, sha256, session_id
+
+
+def _compatibility_versions(path: Path) -> set[str]:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(document, dict)
+        or document.get("schema") != "runtime.codex-source-lock.v1"
+        or not isinstance(document.get("compatibilityProducers"), list)
+    ):
+        raise ValueError("source lock is malformed")
+    versions = {
+        producer["version"]
+        for producer in document["compatibilityProducers"]
+        if isinstance(producer, dict) and isinstance(producer.get("version"), str)
+    }
+    if len(versions) != len(document["compatibilityProducers"]):
+        raise ValueError("source lock has malformed compatibility producers")
+    return versions
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Project the four digest-pinned Codex compatibility rollouts"
+    )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=Path(".tmp/codex-rollout-compat.json"),
+    )
+    parser.add_argument(
+        "--source-lock",
+        type=Path,
+        default=_DEFAULT_SOURCE_LOCK,
+    )
+    args = parser.parse_args()
+    manifest_path = args.manifest.expanduser().resolve()
+    try:
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        compatibility_versions = _compatibility_versions(
+            args.source_lock.expanduser().resolve()
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        print(f"FAIL manifest: {error}")
+        return 1
+    if (
+        not isinstance(document, dict)
+        or document.get("schema") != "runtime.rollout-compat.v1"
+        or document.get("producerVersion") not in compatibility_versions
+        or not isinstance(document.get("rollouts"), list)
+        or len(document["rollouts"]) != 4
+        or set(document) != {"schema", "producerVersion", "rollouts"}
+    ):
+        print(
+            "FAIL manifest: expected an allowed producer and exactly four rollouts"
+        )
+        return 1
+
+    passed = 0
+    for index, value in enumerate(document["rollouts"]):
+        label = f"rollout[{index}]"
+        try:
+            path, expected_digest, expected_session = _entry(value, index)
+            label = str(path)
+            if not path.is_file():
+                raise ValueError("path is missing")
+            observed_digest = _digest(path)
+            if observed_digest != expected_digest:
+                raise ValueError(
+                    f"SHA-256 mismatch: expected {expected_digest}, "
+                    f"observed {observed_digest}"
+                )
+            repository = _metadata_repository(path)
+            admitted = resolve_rollout(repository, explicit=path)
+            if admitted.session_id != expected_session:
+                raise ValueError(
+                    f"session mismatch: expected {expected_session}, "
+                    f"observed {admitted.session_id}"
+                )
+            project_rollout(admitted)
+        except Exception as error:
+            print(f"FAIL {label}: {error}")
+        else:
+            passed += 1
+            print(f"PASS {label}: session={expected_session} projection=success")
+    print(f"{passed}/4 rollouts projected successfully")
+    return 0 if passed == 4 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

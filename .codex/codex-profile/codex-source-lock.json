@@ -1,0 +1,16 @@
+{
+  "schema": "runtime.codex-source-lock.v1",
+  "upstream": {
+    "repository": "openai/codex",
+    "channel": "stable",
+    "version": "0.145.0",
+    "tag": "rust-v0.145.0",
+    "revision": "25af12f7e61572b0bc18ddb1008be543b91519b0"
+  },
+  "compatibilityProducers": [
+    {
+      "version": "0.146.0-alpha.12",
+      "purpose": "forward compatibility corpus"
+    }
+  ]
+}
